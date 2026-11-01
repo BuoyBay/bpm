@@ -1,0 +1,338 @@
+Import processkit
+
+' Linux host bootstrap. Every child receives literal argument arrays; no shell
+' or Python interpreter participates in building or sealing BPM.
+Declare Function AtomicRename Lib "c" Alias "rename" (source As String, destination As String) As Int32
+
+Sub Need(passed As Boolean, message As String)
+    If Not passed Then Throw New Exception(message)
+End Sub
+
+Function Environment(name As String, fallback As String = "") As String
+    Return System.EnvironmentVariable(name).Or(fallback)
+End Function
+
+Function Executable(name As String) As String
+    If String.Contains(name, "/", True) Then
+        Dim direct As New FileSystemItem(name)
+        Need(direct.IsFile(), "executable not found: " + name)
+        Return direct.FullPath()
+    End If
+    For Each directory As String In String.Split(Environment("PATH"), ":")
+        If directory = "" Then Continue For
+        Dim candidate As New FileSystemItem(Path.Join(directory, name))
+        If candidate.IsFile() And (candidate.Permissions.Mode And 73) <> 0 Then Return candidate.FullPath()
+    Next
+    Throw New Exception("executable not found: " + name)
+End Function
+
+Function Run(program As String, arguments As Array Of String, cwd As String = "", environmentRoot As String = "") As String
+    Dim environmentValues As New Map Of String, String()
+    If environmentRoot <> "" Then
+        For Each key As String In ["HOME", "USERPROFILE", "XDG_DATA_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA", "APPDATA"]
+            environmentValues.Set(key, Path.Join(environmentRoot, key))
+        Next
+    End If
+    Dim child As New PipeProcess(Executable(program), arguments, cwd, environmentValues, True)
+    Dim output As New Bytes()
+    Dim errors As New Bytes()
+    Dim started As Integer = System.Microseconds()
+    Try
+        child.CloseInput()
+        Do
+            output.Append(child.ReadOutput())
+            errors.Append(child.ReadError())
+            Need(output.Count + errors.Count <= 16777216, "child output exceeded 16 MiB")
+            Need(System.Microseconds() - started < 180000000, "child exceeded 180 second deadline: " + program)
+            Dim running As Boolean = child.Poll()
+            If Not running And child.OutputClosed And child.ErrorClosed Then Exit Do
+            Sleep(1)
+        Loop
+        Dim errorText As String = errors.ToString(Text.Encodings.UTF8)
+        Need(child.ExitCode = 0, program + " failed: " + output.ToString(Text.Encodings.UTF8) + errorText)
+        If errorText <> "" Then StdErr.Write(errorText)
+        Return output.ToString(Text.Encodings.UTF8)
+    Finally
+        child.Close()
+    End Try
+End Function
+
+Function Absolute(filename As String, cwd As String) As String
+    If String.StartsWith(filename, "/", True) Then Return filename
+    Return Path.Join(cwd, filename)
+End Function
+
+Function SourceFile(root As String, preferred As String, legacy As String) As String
+    Dim first As New FileSystemItem(Path.Join(root, preferred))
+    If first.IsFile() Then Return first.FullPath()
+    Dim fallback As New FileSystemItem(Path.Join(root, legacy))
+    Need(fallback.IsFile(), "source input missing: " + preferred + " (legacy " + legacy + ")")
+    Return fallback.FullPath()
+End Function
+
+Function ProcessSource(root As String, explicitRoot As String) As String
+    If explicitRoot <> "" Then
+        Dim supplied As New FileSystemItem(Absolute(explicitRoot, root))
+        If supplied.IsFile() Then Return supplied.FullPath()
+        Dim bridge As FileSystemItem = supplied.Child("native/bridge.c")
+        Need(bridge.IsFile(), "--processkit must identify its checkout root or native/bridge.c")
+        Return bridge.FullPath()
+    End If
+    For Each relative As String In ["../processkit/native/bridge.c", "repos/processkit/native/bridge.c", "libraries/processkit/native/bridge.c"]
+        Dim source As New FileSystemItem(Path.Join(root, relative))
+        If source.IsFile() Then Return source.FullPath()
+    Next
+    Throw New Exception("ProcessKit source not found; clone its public checkout beside BPM or pass --processkit DIR")
+End Function
+
+Sub Directory(filename As String)
+    Dim folder As New FileSystemItem(filename)
+    Need(folder.CreateFolder(True), "cannot create " + filename)
+End Sub
+
+Function ReadText(filename As String) As String
+    Dim file As New FileSystemItem(filename)
+    Dim outcome As Result Of String, String = file.ReadAllText()
+    Need(outcome.IsOk, "cannot read " + filename)
+    Return outcome.Value
+End Function
+
+Sub WriteText(filename As String, body As String)
+    Dim file As New FileSystemItem(filename)
+    Dim outcome As Result Of Integer, String = file.WriteAllText(body)
+    Need(outcome.IsOk, "cannot write " + filename)
+End Sub
+
+Sub Copy(source As String, destination As String)
+    Run("cp", ["--preserve=mode", "--", source, destination])
+End Sub
+
+Function Digest(filename As String) As String
+    Dim output As String = Run("sha256sum", ["--", filename])
+    Dim digest As String = String.Substring(output, 0, 64)
+    Need(String.Len(digest) = 64, "invalid SHA-256 output")
+    Return digest
+End Function
+
+Function ReplaceHook(body As String, before As String, after As String) As String
+    Dim first As Integer = String.IndexOf(body, before, 0, True)
+    Need(first >= 0, "ProcessKit source hook missing: " + before)
+    Need(String.IndexOf(body, before, first + String.Len(before), True) < 0, "ProcessKit source hook is ambiguous: " + before)
+    Return String.Replace(body, before, after, 1, True)
+End Function
+
+Function PrivateProcess(body As String) As String
+    body = ReplaceHook(body, "int started, exited, eof[2], owned_tree, signal_number, tree_terminated;", "int started, exited, eof[2], owned_tree, signal_number, tree_terminated; int64_t file_limit;")
+    body = ReplaceHook(body, "/* execve, unlike execvp, never falls back", "if (p->file_limit) { struct rlimit limit = {(rlim_t)p->file_limit, (rlim_t)p->file_limit}; if (setrlimit(RLIMIT_FSIZE, &limit)) { child_start_failure(3, errno); } }\n        /* execve, unlike execvp, never falls back")
+    body = ReplaceHook(body, "*value = wide_text(p->env_values[i]);", "*value = wide_text(p->env_values[i] ? p->env_values[i] : \"\");")
+    body = ReplaceHook(body, "entries[count++] = entry;\n    }\n    qsort", "if (p->env_values[i]) entries[count++] = entry; else { clear_text(entry, wcslen(entry) * sizeof(wchar_t)); free(entry); }\n    }\n    qsort")
+    body = ReplaceHook(body, "value_size = strlen(p->env_values[i]);", "value_size = p->env_values[i] ? strlen(p->env_values[i]) : 0;")
+    body = ReplaceHook(body, "memcpy(entry + name_size + 1, p->env_values[i], value_size + 1);", "memcpy(entry + name_size + 1, p->env_values[i] ? p->env_values[i] : \"\", value_size + 1);")
+    body = ReplaceHook(body, "entries[count++] = entry; entries[count] = NULL;", "if (p->env_values[i]) entries[count++] = entry; else free_environment_text(entry); entries[count] = NULL;")
+    Return String.Replace(body, "bpk_", "bph_proc_", String.Len(body), True)
+End Function
+
+Sub VerifyELF(filename As String, target As String)
+    Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(New FileSystemItem(filename), False)
+    Need(opened.IsOk, "cannot inspect ELF " + filename)
+    Dim stream As BinaryStream = opened.Value
+    Dim header As Bytes = stream.Read(20)
+    stream.Close()
+    Need(header.Count = 20, "short ELF " + filename)
+    Need(header.Item(0) = 127 And header.Item(1) = 69 And header.Item(2) = 76 And header.Item(3) = 70 And header.Item(4) = 2 And header.Item(5) = 1, "expected little-endian ELF64: " + filename)
+    Dim machine As Integer = 62
+    If target = "arm64-linux" Then machine = 183
+    Need(header.Item(18) = machine And header.Item(19) = 0, "ELF target mismatch: " + filename)
+End Sub
+
+Function WithArguments(prefix As Array Of String, tail As Array Of String) As Array Of String
+    Dim outcome As Array Of String = Array.Clone(prefix)
+    For Each argument As String In tail
+        Array.Append(outcome, argument)
+    Next
+    Return outcome
+End Function
+
+Sub Usage()
+    Print "Native BPM Linux host builder (requires ProcessKit to compile this driver)"
+    Print "build-bpm [--root DIR] [--output FILE] [--target HOST]"
+    Print "          [--compiler FILE] [--compiler-arg ARG] [--packager FILE] [--packager-arg ARG]"
+    Print "          [--cc FILE] [--cc-arg ARG]"
+    Print "          [--processkit DIR] (defaults to sibling ProcessKit checkout, then integration tree)"
+    Print "Compiler, packager and CC values are executable paths, not shell command strings."
+End Sub
+
+Function Main(args As Array Of String) As Integer
+    Dim temporary As String = ""
+    Dim publication As String = ""
+    Try
+        #If Not TargetLinux Then
+            Throw New Exception("native BPM builder currently supports Linux hosts only; use the documented legacy cross-platform builder")
+        #End If
+        Dim noArguments As Array Of String = []
+        Dim cwd As String = String.Trim(Run("pwd", noArguments))
+        Dim root As String = cwd
+        Dim output As String = "dist/bpm-native-client/bpm"
+        Dim compiler As String = Environment("BPM_BUOY", Environment("BUOY", "buoy"))
+        Dim packager As String = Environment("BPM_PACKAGER", "")
+        Dim cc As String = Environment("CC", "cc")
+        Dim processkit As String = Environment("BPM_PROCESSKIT", "")
+        Dim compilerArgs As Array Of String = []
+        Dim packagerArgs As Array Of String = []
+        Dim ccArgs As Array Of String = []
+        Dim architecture As String = String.Trim(Run("uname", ["-m"]))
+        Dim target As String = "x86_64-linux"
+        If architecture = "aarch64" Or architecture = "arm64" Then target = "arm64-linux"
+        Need(architecture = "x86_64" Or architecture = "aarch64" Or architecture = "arm64", "unsupported Linux host architecture: " + architecture)
+        Dim host As String = target
+        For index As Integer = 1 To Array.Count(args) - 1
+            Dim optionName As String = args(index)
+            If optionName = "--help" Then
+                Usage()
+                Return 0
+            End If
+            Need(index + 1 < Array.Count(args), "missing argument for " + optionName)
+            index += 1
+            Select Case optionName
+            Case "--root"
+                root = Absolute(args(index), cwd)
+            Case "--output"
+                output = args(index)
+            Case "--target"
+                target = args(index)
+            Case "--compiler"
+                compiler = args(index)
+            Case "--packager"
+                packager = args(index)
+            Case "--cc"
+                cc = args(index)
+            Case "--processkit"
+                processkit = args(index)
+            Case "--compiler-arg"
+                Array.Append(compilerArgs, args(index))
+            Case "--packager-arg"
+                Array.Append(packagerArgs, args(index))
+            Case "--cc-arg"
+                Array.Append(ccArgs, args(index))
+            Case Else
+                Throw New Exception("unsupported option: " + optionName)
+            End Select
+        Next
+        Need(target = host, "cross-target builds are not supported by this native host driver: " + target)
+        compiler = Executable(compiler)
+        cc = Executable(cc)
+        If packager = "" Then
+            packager = compiler
+            If compiler = "/usr/local/bin/buoy" Then packager = "/usr/bin/buoy"
+        End If
+        packager = Executable(packager)
+        output = Absolute(output, root)
+        Dim outputFile As New FileSystemItem(output)
+        Directory(outputFile.ParentPath())
+        temporary = String.Trim(Run("mktemp", ["-d", Path.Join(Environment("TMPDIR", "/tmp"), "bpm-native-build-XXXXXX")]))
+        Dim mainSource As String = SourceFile(root, "src/main.bui", "tools/bpm/main.bui")
+        Dim nativeSource As String = SourceFile(root, "src/native/bridge.c", "tools/bpm/native/bridge.c")
+        Dim processkitSource As String = ProcessSource(root, processkit)
+        Dim inputPaths As JSONItem = JSONItem.NewObject()
+        inputPaths.Value("main") = mainSource
+        inputPaths.Value("nativeHost") = nativeSource
+        inputPaths.Value("processkit") = processkitSource
+        inputPaths.Value("builder") = Path.Join(root, "tools/build_bpm.bui")
+        Dim inputHashes As JSONItem = JSONItem.NewObject()
+        For Each name As String In inputPaths.Keys()
+            inputHashes.Value(name) = Digest(inputPaths.Value(name).AsString().Value)
+        Next
+        Dim compilerHash As String = Digest(compiler)
+        Dim ccHash As String = Digest(cc)
+        Dim packagerHash As String = Digest(packager)
+        Dim compilerVersion As String = String.Trim(Run(compiler, WithArguments(compilerArgs, ["--version"])))
+        WriteText(Path.Join(temporary, "bridge.c"), ReadText(nativeSource))
+        WriteText(Path.Join(temporary, "bpm_processkit.inc"), PrivateProcess(ReadText(processkitSource)))
+        Dim triple As String = "x86_64-unknown-linux-gnu"
+        If host = "arm64-linux" Then triple = "aarch64-unknown-linux-gnu"
+        Dim packageRoot As String = Path.Join(temporary, "host")
+        Directory(Path.Join(packageRoot, "runtime/" + triple))
+        Dim library As String = Path.Join(packageRoot, "runtime/" + triple + "/libbuoy_bpm_host.so")
+        Run(cc, WithArguments(ccArgs, ["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-pthread", "-fPIC", "-shared", "-Wl,-soname,libbuoy_bpm_host.so", "-I", temporary, Path.Join(temporary, "bridge.c"), "-o", library]), temporary)
+        VerifyELF(library, host)
+        Dim nativeHash As String = Digest(library)
+        WriteText(Path.Join(packageRoot, "manifest.json"), "{\"schema\":1,\"name\":\"bpmhost\",\"version\":\"0.1.0\",\"libraries\":[{\"libName\":\"buoy_bpm_host\",\"system\":false,\"minVersion\":\"0.1.0\"}]}")
+        Directory(Path.Join(temporary, "packages"))
+        Dim archive As String = Path.Join(temporary, "packages/bpmhost-0.1.0.buipkg")
+        Print String.Trim(Run(packager, WithArguments(packagerArgs, ["pkg", "seal", packageRoot, "-o", archive]), temporary))
+        WriteText(Path.Join(temporary, "main.bui"), ReadText(mainSource))
+        Dim isolated As New Map Of String, String()
+        For Each key As String In ["HOME", "USERPROFILE", "XDG_DATA_HOME", "XDG_CACHE_HOME", "LOCALAPPDATA", "APPDATA"]
+            isolated.Set(key, Path.Join(temporary, "isolated/" + key))
+            Directory(Path.Join(temporary, "isolated/" + key))
+        Next
+        For Each checked As String In ["x86_64-linux", "arm64-linux", "x86_64-darwin", "arm64-darwin", "x86_64-windows", "arm64-windows"]
+            Dim diagnostics As JSONItem = Json.Parse(Run(compiler, WithArguments(compilerArgs, ["main.bui", "--check", "--diagnostic-format", "json", "--target", checked]), temporary, Path.Join(temporary, "isolated")))
+            Need(diagnostics.Value("errors").IsArray And diagnostics.Value("warnings").IsArray, "invalid compiler diagnostic envelope")
+            Need(diagnostics.Value("errors").Count = 0 And diagnostics.Value("warnings").Count = 0, "compiler diagnostics for " + checked + ": " + diagnostics.ToString())
+            Print "Checked " + checked
+        Next
+        Dim emitted As String = Path.Join(temporary, "output")
+        Directory(emitted)
+        Run(compiler, WithArguments(compilerArgs, ["main.bui", "--target", host, "-o", Path.Join(emitted, outputFile.Name())]), temporary, Path.Join(temporary, "isolated"))
+        VerifyELF(Path.Join(emitted, outputFile.Name()), host)
+        Dim deployedLibrary As New FileSystemItem(Path.Join(emitted, "libbuoy_bpm_host.so"))
+        Need(deployedLibrary.IsFile(), "compiler did not deploy the private host runtime")
+        Need(Digest(deployedLibrary.FullPath()) = nativeHash, "deployed host runtime differs from compiled slice")
+        For Each name As String In inputHashes.Keys()
+            Need(String.Compare(Digest(inputPaths.Value(name).AsString().Value), inputHashes.Value(name).AsString().Value, True) = 0, "build input changed: " + name)
+        Next
+        Need(Digest(compiler) = compilerHash And Digest(cc) = ccHash And Digest(packager) = packagerHash, "tool executable changed while building")
+        Dim receipt As JSONItem = JSONItem.NewObject()
+        receipt.Value("schema") = 1
+        receipt.Value("target") = host
+        receipt.Value("executable") = outputFile.Name()
+        Dim files As JSONItem = JSONItem.NewObject()
+        Dim emittedFolder As New FileSystemItem(emitted)
+        For Each file As FileSystemItem In emittedFolder.Children()
+            Need(file.IsFile(), "unexpected compiler output: " + file.FullPath())
+            files.Value(file.Name()) = Digest(file.FullPath())
+        Next
+        receipt.Value("files") = files
+        Dim build As JSONItem = JSONItem.NewObject()
+        build.Value("driver") = "native-buoy-linux-v1"
+        build.Value("sourceSHA256") = inputHashes
+        build.Value("sourcePaths") = inputPaths
+        build.Value("compilerVersion") = compilerVersion
+        build.Value("compiler") = compiler
+        build.Value("packager") = packager
+        build.Value("cc") = cc
+        build.Value("compilerExecutableSHA256") = compilerHash
+        build.Value("ccExecutableSHA256") = ccHash
+        build.Value("packagerExecutableSHA256") = packagerHash
+        build.Value("hostPackageSHA256") = Digest(archive)
+        build.Value("nativeRuntimeSHA256") = nativeHash
+        receipt.Value("build") = build
+        publication = String.Trim(Run("mktemp", ["-d", Path.Join(outputFile.ParentPath(), ".bpm-publish-XXXXXX")]))
+        Dim priorReceipt As New FileSystemItem(output + ".runtime.json")
+        If priorReceipt.Exists() Then Need(priorReceipt.Delete(), "cannot invalidate old runtime receipt")
+        For Each file As FileSystemItem In emittedFolder.Children()
+            Dim staging As String = Path.Join(publication, file.Name())
+            Copy(file.FullPath(), staging)
+            Need(Digest(staging) = files.Value(file.Name()).AsString().Value, "published file hash mismatch")
+            Need(AtomicRename(staging, Path.Join(outputFile.ParentPath(), file.Name())) = 0, "cannot publish " + file.Name())
+        Next
+        Dim stagedReceipt As String = Path.Join(publication, "runtime.json")
+        WriteText(stagedReceipt, receipt.ToString() + "\n")
+        Need(AtomicRename(stagedReceipt, output + ".runtime.json") = 0, "cannot publish runtime receipt")
+        Print "Built " + output
+        Return 0
+    Catch problem As Exception
+        StdErr.WriteLine("build-bpm: " + problem.Message)
+        Return 1
+    Finally
+        If publication <> "" Then
+            Dim folder As New FileSystemItem(publication)
+            folder.Delete(True)
+        End If
+        If temporary <> "" Then
+            Dim folder As New FileSystemItem(temporary)
+            folder.Delete(True)
+        End If
+    End Try
+End Function

@@ -1,0 +1,299 @@
+' Authenticated, immutable reference registry. Native execution: Linux only.
+Package HTTPServer
+Package Crypto
+
+Declare Function StoreOpen Lib "bpm_registry_storage" Alias "bpr_open" (directory As String) As Integer
+Declare Sub StoreClose Lib "bpm_registry_storage" Alias "bpr_close" (descriptor As Integer)
+Declare Function StoreCreate Lib "bpm_registry_storage" Alias "bpr_create" (descriptor As Integer, relative As String, data As Ptr, length As Integer) As Integer
+Declare Function StoreRead Lib "bpm_registry_storage" Alias "bpr_read" (descriptor As Integer, relative As String, maximum As Integer) As Ptr
+Declare Function StoreReadSize Lib "bpm_registry_storage" Alias "bpr_read_size" () As Integer
+Declare Function StoreReadError Lib "bpm_registry_storage" Alias "bpr_read_error" () As Integer
+Declare Sub StoreFree Lib "bpm_registry_storage" Alias "bpr_free" (buffer As Ptr)
+
+Class RegistryState
+    Public Shared Property Descriptor As Integer = -1
+    Public Shared Property Token As Bytes
+    Public Shared Property Scope As String
+    Public Shared Property Maximum As Integer = 33554432
+    Public Shared Property Gate As Mutex
+End Class
+
+Class RegistryServer Inherits HTTPServer
+    Public Overrides Sub OnUnhandledError(request As HttpRequest, response As HttpResponse, ex As Exception)
+        response.StatusCode = 500
+        response.Write("Registry storage operation failed\n")
+    End Sub
+End Class
+
+Function ValidPart(value As String) As Boolean
+    If value = "" Or String.Len(value) > 128 Then Return False
+    For Each character As String In String.Chars(value)
+        If Not String.Contains("abcdefghijklmnopqrstuvwxyz0123456789-_", character, True) Then Return False
+    Next
+    Return True
+End Function
+
+Function ValidName(value As String) As Boolean
+    If value = "" Or String.Len(value) > 128 Then Return False
+    For Each character As String In String.Chars(value)
+        If Not String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", character, True) Then Return False
+    Next
+    Return Not String.Contains("0123456789", String.Left(value, 1), True)
+End Function
+
+Function Digits(value As String) As Boolean
+    If value = "" Then Return False
+    For Each character As String In String.Chars(value)
+        If Not String.Contains("0123456789", character, True) Then Return False
+    Next
+    Return True
+End Function
+
+Function ValidVersion(value As String) As Boolean
+    If value = "" Or String.Len(value) > 128 Then Return False
+    Dim buildParts As Array Of String = String.Split(value, "+")
+    If buildParts.Count > 2 Then Return False
+    Dim mainPart As String = buildParts(0)
+    Dim dash As Integer = String.IndexOf(mainPart, "-", 0, True)
+    Dim coreText As String = mainPart
+    If dash >= 0 Then coreText = String.Left(mainPart, dash)
+    Dim parts As Array Of String = String.Split(coreText, ".")
+    If parts.Count <> 3 Then Return False
+    For Each part As String In parts
+        If Not Digits(part) Then Return False
+        If String.Len(part) > 1 And String.Left(part, 1) = "0" Then Return False
+    Next
+    Dim identifiers As Array Of String = []
+    If dash >= 0 Then
+        For Each part As String In String.Split(String.Substring(mainPart, dash + 1), ".")
+            If Digits(part) And String.Len(part) > 1 And String.Left(part, 1) = "0" Then Return False
+            Array.Append(identifiers, part)
+        Next
+    End If
+    If buildParts.Count = 2 Then
+        For Each part As String In String.Split(buildParts(1), ".")
+            Array.Append(identifiers, part)
+        Next
+    End If
+    For Each part As String In identifiers
+        If part = "" Then Return False
+        For Each character As String In String.Chars(part)
+            If Not String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-", character, True) Then Return False
+        Next
+    Next
+    Return True
+End Function
+
+Function ValidDigest(value As String) As Boolean
+    If String.Len(value) <> 64 Then Return False
+    For Each character As String In String.Chars(value)
+        If Not String.Contains("0123456789abcdef", character, True) Then Return False
+    Next
+    Return True
+End Function
+
+Function ReadBytes(relative As String, maximum As Integer) As Bytes
+    Dim pointer As Ptr = StoreRead(RegistryState.Descriptor, relative, maximum)
+    If pointer = Nil Then Throw New Exception("Unavailable stored payload", StoreReadError())
+    Try
+        Dim data As New Bytes()
+        data.Append(pointer, StoreReadSize())
+        Return data
+    Finally
+        StoreFree(pointer)
+    End Try
+End Function
+
+Function Authenticated(request As HttpRequest, response As HttpResponse) As Boolean
+    Dim offered As String = request.Header("Authorization").Or("")
+    Dim supplied As Bytes = Bytes.FromString(offered, Text.Encodings.UTF8)
+    If Not Crypto.ConstantTimeEquals(supplied, RegistryState.Token) Then
+        response.StatusCode = 401
+        response.SetHeader("WWW-Authenticate", "Bearer")
+        response.Write("Authentication required\n")
+        Return False
+    End If
+    Return True
+End Function
+
+Function RequestRelative(request As HttpRequest) As String
+    Dim coordinate As String = request.RouteParam("name").Or("")
+    Dim scopeText As String = request.RouteParam("scope").Or("")
+    Dim version As String = request.RouteParam("version").Or("")
+    Dim filename As String = request.RouteParam("file").Or("")
+    If Not ValidPart(coordinate) Or Not ValidVersion(version) Then Throw New Exception("Invalid package coordinate", 400)
+    If scopeText <> "" Then
+        If String.Left(scopeText, 1) <> "@" Or Not ValidPart(String.Substring(scopeText, 1)) Then Throw New Exception("Invalid scope", 400)
+        If scopeText <> RegistryState.Scope Then Throw New Exception("Scope is not authorized", 403)
+        coordinate = scopeText + "/" + coordinate
+    ElseIf RegistryState.Scope <> "unscoped" Then
+        Throw New Exception("Scope is not authorized", 403)
+    End If
+    If filename <> "release.json" And filename <> "package.buipkg" And filename <> "bpm.json" And filename <> "release.bpm.tar" Then Throw New Exception("Unknown registry file", 404)
+    Return coordinate + "/" + version + "/" + filename
+End Function
+
+Function Canonical(value As JSONItem) As String
+    If value.IsObject() Then
+        Dim keys As Array Of String = value.Keys()
+        Array.Sort(keys)
+        Dim pieces As Array Of String = []
+        For Each key As String In keys
+            Array.Append(pieces, Json.Stringify(JSONItem.From(key)) + ":" + Canonical(value.Value(key)))
+        Next
+        Return "{" + String.Join(pieces, ",") + "}"
+    ElseIf value.IsArray() Then
+        Dim pieces As Array Of String = []
+        For i As Integer = 0 To value.Count() - 1
+            Array.Append(pieces, Canonical(value.ValueAt(i)))
+        Next
+        Return "[" + String.Join(pieces, ",") + "]"
+    End If
+    Return Json.Stringify(value)
+End Function
+
+Sub ValidateDependencies(dependencies As JSONItem)
+    If Not dependencies.IsObject() Then Throw New Exception("Dependencies must be an object", 400)
+    For Each name As String In dependencies.Keys()
+        If Not ValidName(name) Then Throw New Exception("Invalid dependency identity", 400)
+        Dim source As JSONItem = dependencies.Value(name)
+        If Not source.IsObject() Then Throw New Exception("Dependency source must be an object", 400)
+        If source.HasKey("path") Or source.HasKey("archive") Then Throw New Exception("Published dependencies cannot use local paths or archives", 400)
+        If source.HasKey("registry") = source.HasKey("git") Then Throw New Exception("Dependency requires exactly one registry or Git origin", 400)
+        If source.HasKey("registry") Then
+            Dim location As String = source.Value("registry").AsString().Or("")
+            If Not String.StartsWith(location, "https://", True) And Not String.StartsWith(location, "/", True) Then Throw New Exception("Published registry origins must be absolute or HTTPS", 400)
+            If Not ValidVersion(source.Value("version").AsString().Or("")) Then Throw New Exception("Invalid registry dependency version", 400)
+        Else
+            Dim location As String = source.Value("git").AsString().Or("")
+            If Not String.StartsWith(location, "https://", True) And Not String.StartsWith(location, "ssh://", True) Then Throw New Exception("Invalid Git dependency origin", 400)
+            If source.HasKey("rev") = source.HasKey("version") Then Throw New Exception("Git dependency requires revision or version", 400)
+            If source.HasKey("version") And Not ValidVersion(source.Value("version").AsString().Or("")) Then Throw New Exception("Invalid Git dependency version", 400)
+            If source.HasKey("rev") And source.Value("rev").AsString().Or("") = "" Then Throw New Exception("Missing Git revision", 400)
+        End If
+    Next
+End Sub
+
+Sub ValidateRelease(relative As String, data As Bytes)
+    If data.Count > 1048576 Then Throw New Exception("Metadata exceeds 1 MiB", 413)
+    Dim metadata As JSONItem = Json.Parse(data.ToString(Text.Encodings.UTF8))
+    If Not metadata.IsObject() Or metadata.Value("schema").AsNumber().Or(0.0) <> 1.0 Then Throw New Exception("Invalid release schema", 400)
+    Dim name As String = metadata.Value("name").AsString().Or("")
+    Dim version As String = metadata.Value("version").AsString().Or("")
+    Dim digest As String = metadata.Value("sha256").AsString().Or("")
+    If Not ValidName(name) Or Not ValidVersion(version) Or Not ValidDigest(digest) Then Throw New Exception("Invalid release identity/digest", 400)
+    ValidateDependencies(metadata.Value("dependencies"))
+    Dim parts As Array Of String = String.Split(relative, "/")
+    If version <> parts(parts.Count - 2) Then Throw New Exception("Release version differs from URL", 400)
+    Dim prefix As String = String.Left(relative, String.Len(relative) - String.Len("release.json"))
+    Dim archive As Bytes = ReadBytes(prefix + "package.buipkg", RegistryState.Maximum)
+    If Crypto.Hash(Crypto.HashAlgorithms.SHA256, archive).ToHex() <> digest Then Throw New Exception("Artifact digest mismatch", 409)
+    Dim settings As JSONItem = Json.Parse(ReadBytes(prefix + "bpm.json", 1048576).ToString(Text.Encodings.UTF8))
+    If Not settings.IsObject() Or settings.Value("schema").AsNumber().Or(0.0) <> 1.0 Then Throw New Exception("Invalid package metadata", 400)
+    Dim requirements As JSONItem = settings.Value("dependencies")
+    If Not settings.HasKey("dependencies") Then requirements = JSONItem.NewObject()
+    ValidateDependencies(requirements)
+    If Canonical(requirements) <> Canonical(metadata.Value("dependencies")) Then Throw New Exception("Release requirements differ from package metadata", 409)
+    Dim bundleDigest As String = metadata.Value("bundleSHA256").AsString().Or("")
+    If Not ValidDigest(bundleDigest) Then Throw New Exception("Missing bundle digest", 400)
+    Dim bundle As Bytes = ReadBytes(prefix + "release.bpm.tar", RegistryState.Maximum)
+    If Crypto.Hash(Crypto.HashAlgorithms.SHA256, bundle).ToHex() <> bundleDigest Then Throw New Exception("Bundle digest mismatch", 409)
+End Sub
+
+Sub HandleRequest(request As HttpRequest, response As HttpResponse)
+    response.SetHeader("Cache-Control", "no-store")
+    If Not Authenticated(request, response) Then Return
+    Try
+        Dim relative As String = RequestRelative(request)
+        ' StoreCreate atomically publishes immutable entries; reads and validation
+        ' can run concurrently without holding Gate across hashing or network I/O.
+        If request.Method = "GET" Then
+            Dim data As Bytes = ReadBytes(relative, RegistryState.Maximum)
+            response.SetHeader("Content-Type", "application/octet-stream")
+            response.Write(data)
+            Return
+        End If
+        If request.Header("If-None-Match").Or("") <> "*" Then Throw New Exception("If-None-Match: * is required", 428)
+        If request.Body.Count > RegistryState.Maximum Then Throw New Exception("Upload exceeds configured limit", 413)
+        If String.EndsWith(relative, "/bpm.json", True) And request.Body.Count > 1048576 Then Throw New Exception("Metadata exceeds 1 MiB", 413)
+        If String.EndsWith(relative, "/release.json", True) Then ValidateRelease(relative, request.Body)
+        Dim resultCode As Integer = StoreCreate(RegistryState.Descriptor, relative, request.Body.DataPtr(), request.Body.Count)
+        If resultCode = 1 Then Throw New Exception("Immutable file already exists", 412)
+        If resultCode <> 0 Then Throw New Exception("Storage operation failed", 500)
+        response.StatusCode = 201
+        response.Write("Created\n")
+    Catch e As Exception
+        Dim code As Integer = e.ErrorCode
+        If code < 400 Or code > 599 Then code = 400
+        response.StatusCode = code
+        If code = 500 Then
+            response.Write("Registry storage operation failed\n")
+        Else
+            response.Write(e.Message + "\n")
+        End If
+    End Try
+End Sub
+
+Function Main(args As Array Of String) As Integer
+    #If Not TargetLinux Then
+        StdErr.WriteLine("The reference registry storage backend currently requires Linux")
+        Return 1
+    #End If
+    Try
+        Dim options As JSONItem = JSONItem.NewObject()
+        Dim index As Integer = 1
+        While index < args.Count
+            If index + 1 >= args.Count Then Throw New Exception("Expected --root DIR --scope @team|unscoped --port PORT --cert FILE --key FILE [--max-bytes N]")
+            Dim flag As String = args(index)
+            If flag <> "--root" And flag <> "--scope" And flag <> "--port" And flag <> "--cert" And flag <> "--key" And flag <> "--max-bytes" Then Throw New Exception("Unknown option")
+            options.Value(flag) = args(index + 1)
+            index += 2
+        End While
+        Dim token As String = System.EnvironmentVariable("BPM_REGISTRY_SERVER_TOKEN").Or("")
+        If String.Len(token) < 16 Or String.Len(token) > 1024 Then Throw New Exception("BPM_REGISTRY_SERVER_TOKEN must contain 16..1024 URL-safe characters")
+        For Each character As String In String.Chars(token)
+            If Not String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~", character, True) Then Throw New Exception("Invalid registry token format")
+        Next
+        RegistryState.Token = Bytes.FromString("Bearer " + token, Text.Encodings.UTF8)
+        RegistryState.Scope = options.Value("--scope").AsString().Or("")
+        If RegistryState.Scope <> "unscoped" Then
+            If String.Left(RegistryState.Scope, 1) <> "@" Or Not ValidPart(String.Substring(RegistryState.Scope, 1)) Then Throw New Exception("Select a single --scope @team or unscoped")
+        End If
+        Dim maximum As String = options.Value("--max-bytes").AsString().Or("33554432")
+        Dim parsedMaximum As Result Of Integer, String = Integer.Parse(maximum)
+        If parsedMaximum.IsErr Then Throw New Exception("Invalid upload limit")
+        RegistryState.Maximum = parsedMaximum.Value
+        If RegistryState.Maximum < 1 Or RegistryState.Maximum > 268435456 Then Throw New Exception("Upload limit must be 1..268435456 bytes")
+        RegistryState.Gate = New Mutex
+        RegistryState.Descriptor = StoreOpen(options.Value("--root").AsString().Or(""))
+        If RegistryState.Descriptor < 0 Then Throw New Exception("Registry root must be an existing absolute, symlink-free directory with no active server")
+        Dim server As New RegistryServer()
+        Dim port As Result Of Integer, String = Integer.Parse(options.Value("--port").AsString().Or("8443"))
+        If port.IsErr Then Throw New Exception("Invalid port")
+        server.Port = port.Value
+        If server.Port < 1 Or server.Port > 65535 Then Throw New Exception("Invalid port")
+        server.Secure = True
+        server.CertificatePath = options.Value("--cert").AsString().Or("")
+        server.PrivateKeyPath = options.Value("--key").AsString().Or("")
+        Dim certificate As New FileSystemItem(server.CertificatePath)
+        Dim privateKey As New FileSystemItem(server.PrivateKeyPath)
+        If Not certificate.IsFile() Or Not privateKey.IsFile() Then Throw New Exception("TLS --cert and --key files are required")
+        server.MaxBodyBytes = RegistryState.Maximum
+        server.MaxHeaderBytes = 16384
+        server.ConnectionTimeout = 15000
+        server.Get("/:name/:version/:file", AddressOf HandleRequest)
+        server.Put("/:name/:version/:file", AddressOf HandleRequest)
+        server.Get("/:scope/:name/:version/:file", AddressOf HandleRequest)
+        server.Put("/:scope/:name/:version/:file", AddressOf HandleRequest)
+        server.Listen()
+        Print "Registry listening with TLS on all interfaces; enforce host firewall policy"
+        RunLoop.Run()
+        server.Close()
+        StoreClose(RegistryState.Descriptor)
+        Return 0
+    Catch e As Exception
+        If RegistryState.Descriptor >= 0 Then StoreClose(RegistryState.Descriptor)
+        StdErr.WriteLine(e.Message)
+        Return 1
+    End Try
+End Function

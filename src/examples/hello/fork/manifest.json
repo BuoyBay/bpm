@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "name": "greetings",
+  "version": "1.0.0",
+  "description": "Local fork of the bpm example",
+  "platforms": [
+    "arm64-apple-macos", "x86_64-apple-macos",
+    "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu",
+    "arm64-pc-windows-msvc", "x86_64-pc-windows-msvc"
+  ]
+}

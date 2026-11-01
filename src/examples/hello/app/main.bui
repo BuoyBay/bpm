@@ -1,0 +1,5 @@
+Import greetings.Greeter As Greeting
+
+Sub Main()
+    Print Greeting.Message()
+End Sub

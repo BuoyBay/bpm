@@ -1,0 +1,3187 @@
+' bpm: package acquisition without changing Buoy source imports.
+
+' Native argv/process and filesystem primitives; no command interpreter.
+Declare Function BPMProcessID Lib "buoy_bpm_host" Alias "bph_pid" () As Integer
+Declare Function HostAlive Lib "buoy_bpm_host" Alias "bph_alive" (pid As Integer) As Integer
+Declare Function HostMkdir Lib "buoy_bpm_host" Alias "bph_mkdir_exclusive" (filename As String) As Integer
+Declare Function HostNoSymlink Lib "buoy_bpm_host" Alias "bph_no_symlink" (filename As String) As Integer
+Declare Function HostRealPath Lib "buoy_bpm_host" Alias "bph_realpath" (filename As String, buffer As Ptr, capacity As Integer) As Integer
+Declare Function HostTemp Lib "buoy_bpm_host" Alias "bph_tempdir" (parent As String, prefix As String, buffer As Ptr, capacity As Integer) As Integer
+Declare Function HostHash Lib "buoy_bpm_host" Alias "bph_sha256_file" (filename As String, buffer As Ptr, capacity As Integer) As Integer
+Declare Function HostTimestamp Lib "buoy_bpm_host" Alias "bph_timestamp" (filename As String) As Integer
+Declare Function HostReplace Lib "buoy_bpm_host" Alias "bph_replace" (source As String, destination As String) As Integer
+Declare Function HostRemoveTree Lib "buoy_bpm_host" Alias "bph_remove_tree" (filename As String) As Integer
+Declare Function HostFind Lib "buoy_bpm_host" Alias "bph_find_executable" (filename As String, buffer As Ptr, capacity As Integer) As Integer
+Declare Function HostMillis Lib "buoy_bpm_host" Alias "bph_millis" () As Integer
+Declare Sub HostSleep Lib "buoy_bpm_host" Alias "bph_sleep" (milliseconds As Integer)
+Declare Function ProcessNew Lib "buoy_bpm_host" Alias "bph_proc_new" (filename As String, directory As String) As Ptr
+Declare Function ProcessArg Lib "buoy_bpm_host" Alias "bph_proc_arg" (handle As Ptr, argument As String) As Integer
+Declare Function ProcessEnv Lib "buoy_bpm_host" Alias "bph_proc_env" (handle As Ptr, name As String, value As String) As Integer
+Declare Function ProcessUnset Lib "buoy_bpm_host" Alias "bph_proc_unset" (handle As Ptr, name As String) As Integer
+Declare Function ProcessFileLimit Lib "buoy_bpm_host" Alias "bph_proc_file_limit" (handle As Ptr, limitBytes As Integer) As Integer
+Declare Function ProcessOwn Lib "buoy_bpm_host" Alias "bph_proc_own_tree" (handle As Ptr) As Integer
+Declare Function ProcessStart Lib "buoy_bpm_host" Alias "bph_proc_start" (handle As Ptr) As Integer
+Declare Function ProcessPoll Lib "buoy_bpm_host" Alias "bph_proc_poll" (handle As Ptr) As Integer
+Declare Function ProcessExit Lib "buoy_bpm_host" Alias "bph_proc_exit" (handle As Ptr) As Integer
+Declare Function ProcessEOF Lib "buoy_bpm_host" Alias "bph_proc_eof" (handle As Ptr, streamIndex As Integer) As Integer
+Declare Function ProcessRead Lib "buoy_bpm_host" Alias "bph_proc_read" (handle As Ptr, streamIndex As Integer, buffer As Ptr, capacity As Integer) As Integer
+Declare Function ProcessError Lib "buoy_bpm_host" Alias "bph_proc_error" (handle As Ptr) As String
+Declare Sub ProcessCloseInput Lib "buoy_bpm_host" Alias "bph_proc_close_input" (handle As Ptr)
+Declare Sub ProcessDelete Lib "buoy_bpm_host" Alias "bph_proc_delete" (handle As Ptr)
+Declare Function NativeAlloc Lib "buoy_bpm_host" Alias "bph_proc_alloc" (capacity As Integer) As Ptr
+Declare Sub NativeFree Lib "buoy_bpm_host" Alias "bph_proc_free" (buffer As Ptr)
+' Strict SemVer 2.0 parsing and precedence without integer overflow.
+
+Public Function DecimalDigits(text As String) As Boolean
+    If text = "" Then
+        Return False
+    End If
+    For Each character As String In String.Chars(text)
+        If Not String.Contains("0123456789", character, True) Then
+            Return False
+        End If
+    Next
+    Return True
+End Function
+
+Public Function ParseVersion(text As String) As JSONItem
+    Dim buildParts As Array Of String = String.Split(text, "+")
+    If buildParts.Count > 2 Then
+        Throw New Exception("Invalid SemVer: " + text)
+    End If
+    Dim mainText As String = buildParts(0)
+    Dim dash As Integer = String.IndexOf(mainText, "-", 0, True)
+    Dim coreText As String = mainText
+    Dim preText As String = ""
+    If dash >= 0 Then
+        coreText = String.Left(mainText, dash)
+        preText = String.Substring(mainText, dash + 1)
+    End If
+    Dim parts As Array Of String = String.Split(coreText, ".")
+    If parts.Count <> 3 Then
+        Throw New Exception("Expected major.minor.patch: " + text)
+    End If
+    Dim core As JSONItem = JSONItem.NewArray()
+    For Each part As String In parts
+        If Not DecimalDigits(part) Or (String.Len(part) > 1 And String.Left(part, 1) = "0") Then
+            Throw New Exception("Invalid SemVer numeric component: " + text)
+        End If
+        core.Add(part)
+    Next
+    Dim pre As JSONItem = JSONItem.NewArray()
+    If dash >= 0 Then
+        For Each part As String In String.Split(preText, ".")
+            ValidateVersionIdentifier(part, text)
+            If DecimalDigits(part) And String.Len(part) > 1 And String.Left(part, 1) = "0" Then
+                Throw New Exception("Leading zero in SemVer pre-release: " + text)
+            End If
+            pre.Add(part)
+        Next
+    End If
+    If buildParts.Count = 2 Then
+        For Each part As String In String.Split(buildParts(1), ".")
+            ValidateVersionIdentifier(part, text)
+        Next
+    End If
+    Dim parsed As JSONItem = JSONItem.NewObject()
+    parsed.Value("core") = core
+    parsed.Value("pre") = pre
+    Return parsed
+End Function
+
+Public Sub ValidateVersionIdentifier(part As String, version As String)
+    If part = "" Then
+        Throw New Exception("Empty SemVer identifier: " + version)
+    End If
+    For Each character As String In String.Chars(part)
+        If Not String.Contains("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-", character, True) Then
+            Throw New Exception("Invalid SemVer identifier: " + version)
+        End If
+    Next
+End Sub
+
+Public Function CompareDecimal(leftText As String, rightText As String) As Integer
+    If String.Len(leftText) < String.Len(rightText) Then
+        Return -1
+    ElseIf String.Len(leftText) > String.Len(rightText) Then
+        Return 1
+    End If
+    Return String.Compare(leftText, rightText, True)
+End Function
+
+Public Function CompareVersion(leftText As String, rightText As String) As Integer
+    Dim leftValue As JSONItem = ParseVersion(leftText)
+    Dim rightValue As JSONItem = ParseVersion(rightText)
+    For i As Integer = 0 To 2
+        Dim order As Integer = CompareDecimal(leftValue.Value("core").ValueAt(i).AsString().Value, rightValue.Value("core").ValueAt(i).AsString().Value)
+        If order <> 0 Then
+            Return order
+        End If
+    Next
+    Dim leftPre As JSONItem = leftValue.Value("pre")
+    Dim rightPre As JSONItem = rightValue.Value("pre")
+    If leftPre.Count() = 0 And rightPre.Count() = 0 Then
+        Return 0
+    ElseIf leftPre.Count() = 0 Then
+        Return 1
+    ElseIf rightPre.Count() = 0 Then
+        Return -1
+    End If
+    For i As Integer = 0 To leftPre.Count() - 1
+        If i >= rightPre.Count() Then
+            Return 1
+        End If
+        Dim a As String = leftPre.ValueAt(i).AsString().Value
+        Dim b As String = rightPre.ValueAt(i).AsString().Value
+        Dim order As Integer
+        If DecimalDigits(a) And DecimalDigits(b) Then
+            order = CompareDecimal(a, b)
+        ElseIf DecimalDigits(a) Then
+            order = -1
+        ElseIf DecimalDigits(b) Then
+            order = 1
+        Else
+            order = String.Compare(a, b, True)
+        End If
+        If order <> 0 Then
+            Return order
+        End If
+    Next
+    If leftPre.Count() < rightPre.Count() Then
+        Return -1
+    End If
+    Return 0
+End Function
+
+
+Function BufferText(buffer As Ptr, length As Integer) As String
+    If length < 0 Then Throw New Exception("Native path/hash operation failed")
+    Dim data As New Bytes
+    If length > 0 Then data.Append(buffer, length)
+    Return data.ToString(Text.Encodings.UTF8)
+End Function
+
+Function Command(arguments As Array Of String, outputLimit As Integer = 16777216) As String
+    Return RunCommand(arguments, JSONItem.NewObject(), outputLimit)
+End Function
+
+Function RunCommand(arguments As Array Of String, environment As JSONItem, outputLimit As Integer = 16777216, fileLimit As Integer = 0) As String
+    If arguments.Count = 0 Then Throw New Exception("Missing executable")
+    If arguments(0) = "tar" Then
+        ' Tar accepts executable actions and parser overrides from its environment.
+        ' Apply this to listing, extraction and packing, including explicit env calls.
+        For Each name As String In ["TAR_OPTIONS", "TAR_READER_OPTIONS", "TAR_WRITER_OPTIONS"]
+            environment.Value(name) = JSONItem.Null()
+        Next
+    End If
+    Dim buffer As Ptr = NativeAlloc(65536)
+    If buffer = Nil Then Throw New Exception("Cannot allocate process buffer")
+    Dim handle As Ptr = Nil
+    Try
+        Dim executable As String = BufferText(buffer, HostFind(arguments(0), buffer, 65536))
+        handle = ProcessNew(executable, "")
+        If handle = Nil Then Throw New Exception("Cannot allocate child process")
+        If ProcessOwn(handle) = 0 Then Throw New Exception(ProcessError(handle))
+        For i As Integer = 1 To arguments.Count - 1
+            If ProcessArg(handle, arguments(i)) = 0 Then Throw New Exception(ProcessError(handle))
+        Next
+        If environment <> Nil Then
+            For Each name As String In environment.Keys()
+                If environment.Value(name).IsNull() Then
+                    If ProcessUnset(handle, name) = 0 Then Throw New Exception(ProcessError(handle))
+                Else
+                    If ProcessEnv(handle, name, environment.Value(name).AsString().Value) = 0 Then Throw New Exception(ProcessError(handle))
+                End If
+            Next
+        End If
+        If fileLimit > 0 Then
+            If ProcessFileLimit(handle, fileLimit) = 0 Then Throw New Exception("Cannot enforce child file-size limit")
+        End If
+        If ProcessStart(handle) = 0 Then Throw New Exception(ProcessError(handle))
+        ProcessCloseInput(handle)
+        Dim output As New Bytes
+        Dim errors As New Bytes
+        Dim deadline As Integer = HostMillis() + 120000
+        While True
+            Dim state As Integer = ProcessPoll(handle)
+            If state < 0 Then Throw New Exception(ProcessError(handle))
+            For streamIndex As Integer = 0 To 1
+                Dim count As Integer = ProcessRead(handle, streamIndex, buffer, 65536)
+                If count < 0 Then Throw New Exception(ProcessError(handle))
+                If output.Count + errors.Count + count > outputLimit Then Throw New Exception("Command output exceeds limit: " + arguments(0))
+                If streamIndex = 0 Then
+                    If count > 0 Then output.Append(buffer, count)
+                Else
+                    If count > 0 Then errors.Append(buffer, count)
+                End If
+            Next
+            If state = 0 And ProcessEOF(handle, 0) <> 0 And ProcessEOF(handle, 1) <> 0 Then Exit While
+            If HostMillis() >= deadline Then Throw New Exception("Command timed out: " + arguments(0))
+            HostSleep(1)
+        End While
+        Dim collected As String = output.ToString(Text.Encodings.UTF8)
+        Dim diagnostic As String = errors.ToString(Text.Encodings.UTF8)
+        If ProcessExit(handle) <> 0 Then Throw New Exception("Command failed: " + arguments(0) + "\n" + collected + diagnostic)
+        If diagnostic <> "" Then StdErr.WriteLine(String.Trim(diagnostic))
+        Return String.Trim(collected)
+    Finally
+        If handle <> Nil Then ProcessDelete(handle)
+        NativeFree(buffer)
+    End Try
+End Function
+
+Function AppendArguments(prefix As Array Of String, suffix As Array Of String) As Array Of String
+    Dim collected As Array Of String = []
+    For Each argument As String In prefix
+        Array.Append(collected, argument)
+    Next
+    For Each argument As String In suffix
+        Array.Append(collected, argument)
+    Next
+    Return collected
+End Function
+
+Sub ExclusiveDirectory(filename As String)
+    NoSymlink(filename)
+    If HostMkdir(filename) <> 1 Then Throw New Exception("Cannot claim directory (existing writer or filesystem error): " + filename)
+End Sub
+
+Function TemporaryIn(parent As String, prefix As String) As String
+    Dim buffer As Ptr = NativeAlloc(65536)
+    If buffer = Nil Then Throw New Exception("Cannot allocate path buffer")
+    Try
+        Return BufferText(buffer, HostTemp(parent, prefix, buffer, 65536))
+    Finally
+        NativeFree(buffer)
+    End Try
+End Function
+
+Function IsAbsolute(filename As String) As Boolean
+    If String.StartsWith(filename, "/", True) Then Return True
+    #If TargetWindows Then
+        If String.StartsWith(filename, "\\\\", True) Then Return True
+        If String.Len(filename) >= 3 And String.Substring(filename, 1, 1) = ":" Then
+            Dim separator As String = String.Substring(filename, 2, 1)
+            Return separator = "/" Or separator = "\\"
+        End If
+    #End If
+    Return False
+End Function
+
+Function ReadText(filename As String) As String
+    Dim file As New FileSystemItem(filename)
+    Dim outcome As Result Of String, String = file.ReadAllText()
+    If outcome.IsErr Then
+        Throw New Exception("Cannot read " + filename + ": " + outcome.Error)
+    End If
+    Return outcome.Value
+End Function
+
+Sub WriteText(filename As String, body As String)
+    Dim file As New FileSystemItem(filename)
+    Dim outcome As Result Of Integer, String = file.WriteAllText(body)
+    If outcome.IsErr Then
+        Throw New Exception("Cannot write " + filename + ": " + outcome.Error)
+    End If
+End Sub
+
+Function LoadObject(filename As String) As JSONItem
+    Dim value As JSONItem = Json.Parse(ReadText(filename))
+    If Not value.IsObject() Then
+        Throw New Exception("Expected JSON object: " + filename)
+    End If
+    Return value
+End Function
+
+Function RequiredString(value As JSONItem, key As String) As String
+    Dim field As JSONItem = value.Value(key)
+    If Not field.IsString() Then
+        Throw New Exception("Expected string: " + key)
+    End If
+    Dim collected As String = field.AsString().Value
+    If collected = "" Then
+        Throw New Exception("Empty string: " + key)
+    End If
+    Return collected
+End Function
+
+Function Canonical(value As JSONItem) As String
+    If value.IsObject() Then
+        Dim keys As Array Of String = value.Keys()
+        Array.Sort(keys)
+        Dim collected As String = "{"
+        For Each key As String In keys
+            If collected <> "{" Then
+                collected += ","
+            End If
+            collected += Json.Stringify(JSONItem.From(key)) + ":" + Canonical(value.Value(key))
+        Next
+        Return collected + "}"
+    End If
+    If value.IsArray() Then
+        Dim collected As String = "["
+        For i As Integer = 0 To value.Count() - 1
+            If i > 0 Then
+                collected += ","
+            End If
+            collected += Canonical(value.ValueAt(i))
+        Next
+        Return collected + "]"
+    End If
+    Return Json.Stringify(value)
+End Function
+
+Sub SaveObject(filename As String, value As JSONItem)
+    Dim options As New JSONOptions
+    options.Compact = False
+    WriteText(filename, Json.Stringify(Json.Parse(Canonical(value)), options) + "\n")
+End Sub
+
+Sub MakeDirectory(filename As String)
+    Dim folder As New FileSystemItem(filename)
+    If Not folder.CreateFolder(True) Then
+        Throw New Exception("Cannot create directory: " + filename)
+    End If
+End Sub
+
+Function Temporary() As String
+    #If TargetWindows Then
+        Dim parent As String = System.EnvironmentVariable("TEMP").Or(System.EnvironmentVariable("TMP").Or(""))
+        If parent = "" Then Throw New Exception("TEMP or TMP must identify the temporary directory")
+    #Else
+        Dim parent As String = System.EnvironmentVariable("TMPDIR").Or("/tmp")
+    #End If
+    Return TemporaryIn(parent, "bpm-")
+End Function
+
+Sub RemoveTemporary(filename As String)
+    #If TargetWindows Then
+        ' Git marks object/pack files read-only. The native remover clears the
+        ' attribute on opened handles and never traverses reparse-point trees.
+        If HostRemoveTree(filename) <> 1 Then Throw New Exception("Cannot remove temporary path: " + filename)
+    #Else
+        CheckGarbageTree(filename)
+        Dim file As New FileSystemItem(filename)
+        If Not file.Delete(True) Then
+            Throw New Exception("Cannot remove temporary path: " + filename)
+        End If
+    #End If
+End Sub
+
+Sub DiscardGuard(filename As String)
+    NoSymlink(filename)
+    Dim source As New FileSystemItem(filename)
+    If Not source.Exists() Then Return
+    Dim parent As String = RootPath(Path.Join(filename, ".."))
+    ' Encoding the owner in the atomic mkdir also protects the interval before
+    ' the owner file exists, including cleanup in a shared local registry.
+    Dim garbage As String = TemporaryIn(parent, ".bpm-gc-" + Str(BPMProcessID()) + "-")
+    WriteText(Path.Join(garbage, "owner"), Str(BPMProcessID()))
+    ' Rename first: recursive deletion must never expose half a live journal.
+    If HostReplace(filename, Path.Join(garbage, "discarded")) <> 1 Then
+        RemoveTemporary(garbage)
+        Throw New Exception("Cannot retire completed transaction: " + filename)
+    End If
+    Try
+        RemoveTemporary(Path.Join(garbage, "discarded"))
+        Dim owner As New FileSystemItem(Path.Join(garbage, "owner"))
+        If owner.Exists() And Not owner.Delete() Then Throw New Exception("Cannot remove retired owner")
+        RemoveTemporary(garbage)
+    Catch cleanup As Exception
+        Dim remaining As New FileSystemItem(garbage)
+        If remaining.Exists() Then
+            StdErr.WriteLine("bpm: completed transaction cleanup deferred at " + garbage + "; run bpm repair")
+        End If
+    End Try
+End Sub
+
+Sub CheckGarbageTree(filename As String, depth As Integer = 0)
+    If depth > 256 Then Throw New Exception("Recovery garbage nesting limit exceeded")
+    NoSymlink(filename)
+    Dim folder As New FileSystemItem(filename)
+    If folder.IsFolder() Then
+        For Each child As FileSystemItem In folder.Children()
+            CheckGarbageTree(child.FullPath(), depth + 1)
+        Next
+    End If
+End Sub
+
+Sub CollectGarbage(parent As String)
+    NoSymlink(parent)
+    Dim folder As New FileSystemItem(parent)
+    If Not folder.IsFolder() Then Return
+    For Each child As FileSystemItem In folder.Children()
+        If String.StartsWith(child.Name(), ".bpm-gc-", True) Then
+            Dim parts As Array Of String = String.Split(child.Name(), "-")
+            Dim suffix As String = ""
+            If parts.Count = 4 Then
+                Dim pidText As String = parts(2)
+                If Not DecimalDigits(pidText) Or Integer.Parse(pidText).Or(0) <= 0 Then Continue For
+                If HostAlive(Integer.Parse(pidText).Value) <> 0 Then Continue For
+                suffix = parts(3)
+            ElseIf parts.Count = 3 Then
+                suffix = parts(2) ' Previously retired directories remain recoverable.
+            Else
+                Continue For
+            End If
+            If String.Len(suffix) <> 32 Then Continue For
+            Dim valid As Boolean = True
+            For Each character As String In String.Chars(suffix)
+                If Not String.Contains("0123456789abcdef", character, True) Then valid = False
+            Next
+            If valid Then
+                NoSymlink(child.FullPath())
+                If child.IsFolder() Then
+                    Dim owner As New FileSystemItem(Path.Join(child.FullPath(), "owner"))
+                    NoSymlink(owner.FullPath())
+                    If owner.IsFile() Then
+                        Dim pidText As String = String.Trim(ReadText(owner.FullPath()))
+                        If Not DecimalDigits(pidText) Or Integer.Parse(pidText).Or(0) <= 0 Then
+                            Throw New Exception("Invalid retired transaction owner; inspect " + child.FullPath())
+                        End If
+                        If HostAlive(Integer.Parse(pidText).Value) <> 0 Then Continue For
+                    End If
+                    CheckGarbageTree(child.FullPath())
+                    Try
+                        RemoveTemporary(child.FullPath())
+                    Catch cleanup As Exception
+                        Dim remaining As New FileSystemItem(child.FullPath())
+                        If remaining.Exists() Then Throw cleanup
+                    End Try
+                End If
+            End If
+        End If
+    Next
+End Sub
+
+Function SHA256(filename As String) As String
+    Dim buffer As Ptr = NativeAlloc(128)
+    If buffer = Nil Then Throw New Exception("Cannot allocate hash buffer")
+    Try
+        Dim digest As String = BufferText(buffer, HostHash(filename, buffer, 128))
+        ValidateHex(digest, 64, "SHA-256")
+        Return digest
+    Finally
+        NativeFree(buffer)
+    End Try
+End Function
+
+Function HashText(body As String) As String
+    Dim work As String = Temporary()
+    Try
+        WriteText(Path.Join(work, "input"), body)
+        Return SHA256(Path.Join(work, "input"))
+    Finally
+        RemoveTemporary(work)
+    End Try
+End Function
+
+Sub CopyFile(source As String, destination As String)
+    NoSymlink(source)
+    NoSymlink(destination)
+    Dim original As New FileSystemItem(source)
+    Dim target As New FileSystemItem(destination)
+    MakeDirectory(target.ParentPath())
+    If Not original.CopyTo(target) Then
+        Throw New Exception("Cannot copy " + source + " to " + destination)
+    End If
+End Sub
+
+Sub CopyTree(source As String, destination As String)
+    NoSymlink(source)
+    MakeDirectory(destination)
+    Dim folder As New FileSystemItem(source)
+    For Each item As FileSystemItem In folder.Children()
+        NoSymlink(item.FullPath())
+        Dim target As String = Path.Join(destination, item.Name())
+        If item.IsFolder() Then
+            CopyTree(item.FullPath(), target)
+        ElseIf item.IsFile() Then
+            CopyFile(item.FullPath(), target)
+        Else
+            Throw New Exception("Unsupported file type: " + item.FullPath())
+        End If
+    Next
+End Sub
+
+Sub NormalizeTimes(directory As String)
+    Dim folder As New FileSystemItem(directory)
+    For Each item As FileSystemItem In folder.Children()
+        NoSymlink(item.FullPath())
+        If item.IsFolder() Then
+            NormalizeTimes(item.FullPath())
+        ElseIf item.IsFile() Then
+            If HostTimestamp(item.FullPath()) <> 1 Then Throw New Exception("Cannot normalize payload timestamp")
+        Else
+            Throw New Exception("Unsupported staged payload")
+        End If
+    Next
+End Sub
+
+Sub AtomicCopy(source As String, destination As String)
+    Dim target As New FileSystemItem(destination)
+    NoSymlink(destination)
+    Dim stage As String = TemporaryIn(target.ParentPath(), ".bpm-")
+    Try
+        CopyFile(source, Path.Join(stage, "new"))
+        Dim file As New FileSystemItem(Path.Join(stage, "new"))
+        If HostReplace(file.FullPath(), target.FullPath()) <> 1 Then
+            Throw New Exception("Cannot replace " + destination)
+        End If
+    Finally
+        RemoveTemporary(stage)
+    End Try
+End Sub
+
+Sub StoreArtifact(source As String, cache As String, digest As String)
+    ValidateHex(digest, 64, "archive SHA-256")
+    NoSymlink(cache)
+    Dim folder As New FileSystemItem(cache)
+    If folder.Parent <> Nil And folder.Parent.Name() = ".bpm" Then
+        NoSymlink(folder.ParentPath())
+    End If
+    Dim destination As String = Path.Join(cache, digest + ".buipkg")
+    NoSymlink(destination)
+    Dim existing As New FileSystemItem(destination)
+    If existing.IsFile() Then
+        If String.Compare(SHA256(destination), digest, True) <> 0 Then
+            Throw New Exception("Immutable artifact cache was modified")
+        End If
+        Return
+    End If
+    AtomicCopy(source, destination)
+    If String.Compare(SHA256(destination), digest, True) <> 0 Then
+        Throw New Exception("Artifact cache copy hash mismatch")
+    End If
+End Sub
+
+Function Identifier(name As String) As Boolean
+    If name = "" Then
+        Return False
+    End If
+    Dim index As Integer = 0
+    For Each character As String In String.Chars(String.LCase(name))
+        Dim allowed As String = "abcdefghijklmnopqrstuvwxyz_"
+        If index > 0 Then
+            allowed += "0123456789"
+        End If
+        If Not String.Contains(allowed, character, True) Then
+            Return False
+        End If
+        index += 1
+    Next
+    Return True
+End Function
+
+Function WithinDirectory(filename As String, directory As String) As Boolean
+    #If TargetWindows Then
+        filename = String.LCase(String.Replace(filename, "\\", "/", String.Len(filename) + 1, True))
+        directory = String.LCase(String.Replace(directory, "\\", "/", String.Len(directory) + 1, True))
+    #End If
+    Return String.Compare(filename, directory, True) = 0 Or String.StartsWith(filename, directory + "/", True)
+End Function
+
+Function PackageDirectory(root As String, create As Boolean) As String
+    Dim candidate As New FileSystemItem(Path.Join(root, "packages"))
+    If create Then
+        MakeDirectory(candidate.FullPath())
+    End If
+    If Not candidate.IsFolder() Then
+        NoSymlink(candidate.FullPath())
+        If candidate.Exists() Then
+            Throw New Exception("Package directory is not a directory")
+        End If
+        Return candidate.FullPath()
+    End If
+    Dim destination As String = RootPath(candidate.FullPath())
+    Dim boundary As String = RootPath(root)
+    Dim lockFile As New FileSystemItem(Path.Join(root, "bpm.lock"))
+    If lockFile.IsFile() Then
+        Dim workspace As JSONItem = LoadObject(lockFile.FullPath()).Value("workspace")
+        If workspace.IsObject() Then
+            Dim workspaceRoot As String = RootPath(Path.Join(root, RequiredString(workspace, "root")))
+            For Each relative As String In WorkspaceMembers(workspaceRoot, Manifest(workspaceRoot)).Keys()
+                If String.Compare(RootPath(Path.Join(workspaceRoot, relative)), boundary, True) = 0 Then
+                    boundary = workspaceRoot
+                    Exit For
+                End If
+            Next
+        End If
+    End If
+    Dim globalPaths As Array Of String = []
+    Dim homeDirectory As String = System.EnvironmentVariable("HOME").Or("")
+    #If TargetWindows Then
+        homeDirectory = System.EnvironmentVariable("USERPROFILE").Or(homeDirectory)
+        Dim localData As String = System.EnvironmentVariable("LOCALAPPDATA").Or("")
+        If localData = "" Then Throw New Exception("LOCALAPPDATA must be set to validate the global package-store boundary")
+        Array.Append(globalPaths, Path.Join(localData, "buoy/packages"))
+    #End If
+    If homeDirectory = "" Then
+        Throw New Exception("HOME must be set to validate the global package-store boundary")
+    End If
+    If homeDirectory <> "" Then
+        Array.Append(globalPaths, Path.Join(homeDirectory, ".local/share/buoy/packages"))
+        Array.Append(globalPaths, Path.Join(homeDirectory, "Library/Application Support/buoy/packages"))
+    End If
+    Dim dataDirectory As String = System.EnvironmentVariable("XDG_DATA_HOME").Or("")
+    If dataDirectory <> "" Then
+        Array.Append(globalPaths, Path.Join(dataDirectory, "buoy/packages"))
+    End If
+    For Each location As String In globalPaths
+        Dim globalFolder As New FileSystemItem(location)
+        If globalFolder.IsFolder() And WithinDirectory(destination, RootPath(location)) Then
+            Throw New Exception("Project installation cannot target Buoy's global package store")
+        End If
+    Next
+    If String.Compare(destination, boundary, True) <> 0 And WithinDirectory(destination, boundary) Then
+        Return destination
+    End If
+    Dim allowed As String = System.EnvironmentVariable("BPM_ALLOW_PACKAGE_DIR").Or("")
+    If allowed <> "" And IsAbsolute(allowed) Then
+        If String.Compare(RootPath(allowed), destination, True) = 0 Then
+            Return destination
+        End If
+    End If
+    Throw New Exception("Package directory leaves the project/workspace; set BPM_ALLOW_PACKAGE_DIR to its exact trusted absolute directory to opt in")
+End Function
+
+Sub RelativePath(relative As String)
+    If relative = "" Or String.StartsWith(relative, "/", True) Or String.Contains(relative, "\\", True) Or String.Contains(relative, ":", True) Then
+        Throw New Exception("Expected relative path: " + relative)
+    End If
+    For Each component As String In String.Split(relative, "/")
+        If component = "" Or component = "." Or component = ".." Then
+            Throw New Exception("Unsafe relative path: " + relative)
+        End If
+        #If TargetWindows Then
+            If String.EndsWith(component, ".", True) Or String.EndsWith(component, " ", True) Then Throw New Exception("Ambiguous Windows path component")
+            Dim stem As String = String.LCase(String.Split(component, ".")(0))
+            For Each reserved As String In ["con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"]
+                If stem = reserved Then Throw New Exception("Reserved Windows path component")
+            Next
+        #End If
+    Next
+End Sub
+
+Sub NoSymlink(filename As String)
+    If HostNoSymlink(filename) <> 1 Then Throw New Exception("Symlinks/reparse points are not supported in package inputs: " + filename)
+End Sub
+
+Sub NoPathSymlinks(root As String, relative As String)
+    RelativePath(relative)
+    Dim cursor As String = root
+    For Each component As String In String.Split(relative, "/")
+        cursor = Path.Join(cursor, component)
+        NoSymlink(cursor)
+    Next
+End Sub
+
+Function RootPath(filename As String) As String
+    Dim buffer As Ptr = NativeAlloc(65536)
+    If buffer = Nil Then Throw New Exception("Cannot allocate path buffer")
+    Try
+        Return BufferText(buffer, HostRealPath(filename, buffer, 65536))
+    Finally
+        NativeFree(buffer)
+    End Try
+End Function
+
+Function Packager() As String
+    Return System.EnvironmentVariable("BPM_PACKAGER").Or("buoy")
+End Function
+
+Function Manifest(root As String) As JSONItem
+    Dim file As New FileSystemItem(Path.Join(root, "bpm.json"))
+    If Not file.IsFile() Then
+        Throw New Exception("No bpm.json in " + root + "; run bpm init")
+    End If
+    Dim value As JSONItem = LoadObject(file.FullPath())
+    If value.Value("schema").AsNumber().Or(0.0) <> 1.0 Then
+        Throw New Exception("Unsupported bpm.json schema")
+    End If
+    For Each key As String In value.Keys()
+        If key <> "schema" And key <> "dependencies" And key <> "replace" And key <> "files" And key <> "workspaces" And key <> "publish" And key <> "allowHosts" And key <> "buoy" Then
+            Throw New Exception("Unsupported bpm.json field: " + key)
+        End If
+    Next
+    If value.HasKey("buoy") Then
+        Dim minimum As String = RequiredString(value, "buoy")
+        ParseVersion(minimum)
+        Dim compilerText As String = Command([System.EnvironmentVariable("BPM_BUOY").Or("buoy"), "--version"])
+        Dim words As Array Of String = String.Split(compilerText, " ")
+        If CompareVersion(words(words.Count - 1), minimum) < 0 Then
+            Throw New Exception("Package requires Buoy " + minimum + " or later")
+        End If
+    End If
+    If value.HasKey("publish") Then
+        If Not value.Value("publish").IsObject() Then
+            Throw New Exception("publish must be an object")
+        End If
+        For Each key As String In value.Value("publish").Keys()
+            If key <> "registry" And key <> "package" Then
+                Throw New Exception("Unsupported publish option: " + key)
+            End If
+        Next
+    End If
+    If value.HasKey("allowHosts") Then
+        Dim hosts As JSONItem = value.Value("allowHosts")
+        If Not hosts.IsArray() Then
+            Throw New Exception("allowHosts must be an array of hostnames")
+        End If
+        For i As Integer = 0 To hosts.Count() - 1
+            If Not hosts.ValueAt(i).IsString() Or hosts.ValueAt(i).AsString().Or("") = "" Then
+                Throw New Exception("allowHosts must contain nonempty hostname strings")
+            End If
+        Next
+    End If
+    For Each key As String In ["dependencies", "replace"]
+        If value.HasKey(key) And Not value.Value(key).IsObject() Then
+            Throw New Exception("Expected object: " + key)
+        End If
+        Dim seen As New JSONItem
+        For Each name As String In value.Value(key).Keys()
+            Dim folded As String = String.LCase(name)
+            If Not Identifier(name) Or folded = "_root" Or folded = "_hosts" Then
+                Throw New Exception("Invalid or reserved dependency name: " + name)
+            End If
+            If seen.HasKey(folded) Then
+                Throw New Exception("Case-colliding dependency names: " + name)
+            End If
+            seen.Value(folded) = True
+        Next
+    Next
+    For Each key As String In value.Value("replace").Keys()
+        If Not Identifier(key) Then
+            Throw New Exception("Invalid replacement name: " + key)
+        End If
+    Next
+    Return value
+End Function
+
+Sub CheckSourcePolicy(source As JSONItem, replacements As JSONItem)
+    Dim hosts As JSONItem = replacements.Value("_hosts")
+    If Not hosts.IsArray() Then
+        Return
+    End If
+    Dim address As String = source.Value("git").AsString().Or(source.Value("registry").AsString().Or(""))
+    If Not String.Contains(address, "://", True) Then
+        Return
+    End If
+    Dim host As String = String.Split(String.Split(address, "://")(1), "/")(0)
+    If String.Contains(host, "@", True) Then
+        Dim pieces As Array Of String = String.Split(host, "@")
+        host = pieces(pieces.Count - 1)
+    End If
+    host = String.Split(host, ":")(0)
+    For i As Integer = 0 To hosts.Count() - 1
+        If hosts.ValueAt(i).AsString().Or("") = host Then
+            Return
+        End If
+    Next
+    Throw New Exception("Source host is not allowed by root allowHosts: " + host)
+End Sub
+
+Function WorkspaceMembers(root As String, settings As JSONItem) As JSONItem
+    Dim members As JSONItem = JSONItem.NewObject()
+    Dim seen As JSONItem = JSONItem.NewObject()
+    If Not settings.HasKey("workspaces") Then
+        Return members
+    End If
+    Dim paths As JSONItem = settings.Value("workspaces")
+    If Not paths.IsArray() Then
+        Throw New Exception("workspaces must be an array of explicit relative directories")
+    End If
+    For i As Integer = 0 To paths.Count() - 1
+        Dim relative As String = paths.ValueAt(i).AsString().Or("")
+        RelativePath(relative)
+        NoPathSymlinks(root, relative)
+        If seen.HasKey(String.LCase(relative)) Then
+            Throw New Exception("Duplicate/case-colliding workspace member: " + relative)
+        End If
+        seen.Value(String.LCase(relative)) = True
+        Dim member As JSONItem = Manifest(Path.Join(root, relative))
+        If member.HasKey("workspaces") Or member.Value("replace").Count() > 0 Or member.HasKey("allowHosts") Then
+            Throw New Exception("Workspace membership, overrides and allowHosts belong at the workspace root")
+        End If
+        members.Value(relative) = member
+    Next
+    Return members
+End Function
+
+Function ProjectFingerprint(root As String) As String
+    Dim settings As JSONItem = Manifest(root)
+    If Not settings.HasKey("workspaces") Then
+        Return HashText(Canonical(settings))
+    End If
+    Dim inputs As JSONItem = JSONItem.NewObject()
+    inputs.Value("root") = settings
+    inputs.Value("members") = WorkspaceMembers(root, settings)
+    Return HashText(Canonical(inputs))
+End Function
+
+Sub ClosureAdd(name As String, graph As JSONItem, selected As JSONItem)
+    name = String.LCase(name)
+    If selected.HasKey(name) Then
+        Return
+    End If
+    If Not graph.HasKey(name) Then
+        Throw New Exception("Lock dependency is absent from graph: " + name)
+    End If
+    selected.Value(name) = graph.Value(name)
+    For Each child As String In graph.Value(name).Value("dependencies").Keys()
+        ClosureAdd(child, graph, selected)
+    Next
+End Sub
+
+Function DependencyClosure(settings As JSONItem, graph As JSONItem) As JSONItem
+    Dim selected As JSONItem = JSONItem.NewObject()
+    For Each name As String In settings.Value("dependencies").Keys()
+        ClosureAdd(name, graph, selected)
+    Next
+    Return selected
+End Function
+
+Function InstallGraph(lock As JSONItem) As JSONItem
+    If lock.HasKey("install") Then
+        Dim selected As JSONItem = JSONItem.NewObject()
+        Dim names As JSONItem = lock.Value("install")
+        For i As Integer = 0 To names.Count() - 1
+            Dim name As String = names.ValueAt(i).AsString().Or("")
+            If Not lock.Value("packages").HasKey(name) Then
+                Throw New Exception("Invalid install set in lock")
+            End If
+            selected.Value(name) = lock.Value("packages").Value(name)
+        Next
+        Return selected
+    End If
+    Return lock.Value("packages")
+End Function
+
+Function Forbidden(relative As String) As Boolean
+    relative = String.LCase(relative)
+    If relative = "bpm-release.json" Or relative = "release.json" Or relative = "release.bpm.tar" Then
+        Return True
+    End If
+    For Each part As String In String.Split(relative, "/")
+        If String.StartsWith(part, ".", True) Or part = "packages" Or part = "node_modules" Or part = "bpm.lock" Or part = "bpm.local.json" Then
+            Return True
+        End If
+        If String.EndsWith(part, ".pem", True) Or String.EndsWith(part, ".key", True) Or String.EndsWith(part, ".buipkg", True) Then
+            Return True
+        End If
+    Next
+    Return False
+End Function
+
+Sub CollectFiles(root As String, relative As String, collected As JSONItem)
+    ' Tar listings escape control characters, so these cannot round-trip through
+    ' the portable release validation protocol. Reject before filesystem access.
+    For Each character As String In String.Chars(relative)
+        Dim scalar As Integer = String.Asc(character)
+        If scalar < 32 Or scalar = 127 Then
+            Throw New Exception("Control characters are not supported in package paths")
+        End If
+    Next
+    RelativePath(relative)
+    If Forbidden(relative) Then
+        Throw New Exception("Refusing forbidden package input: " + relative)
+    End If
+    Dim file As New FileSystemItem(Path.Join(root, relative))
+    NoPathSymlinks(root, relative)
+    If file.IsFolder() Then
+        For Each child As FileSystemItem In file.Children()
+            CollectFiles(root, relative + "/" + child.Name(), collected)
+        Next
+    ElseIf file.IsFile() Then
+        Dim folded As String = String.LCase(relative)
+        If collected.HasKey(folded) Then
+            If String.Compare(collected.Value(folded).AsString().Value, relative, True) <> 0 Then
+                Throw New Exception("Case-colliding package paths: " + relative)
+            End If
+        Else
+            collected.Value(folded) = relative
+        End If
+    Else
+        Throw New Exception("Missing or unsupported package input: " + relative)
+    End If
+End Sub
+
+Function PackageFiles(root As String, settings As JSONItem) As Array Of String
+    Dim selected As New JSONItem
+    CollectFiles(root, "manifest.json", selected)
+    Dim bpmFile As New FileSystemItem(Path.Join(root, "bpm.json"))
+    If bpmFile.IsFile() Then
+        CollectFiles(root, "bpm.json", selected)
+    End If
+    If settings.HasKey("files") Then
+        Dim allow As JSONItem = settings.Value("files")
+        If Not allow.IsArray() Then
+            Throw New Exception("files must be an array of literal file/directory paths; globs are not supported yet")
+        End If
+        For i As Integer = 0 To allow.Count() - 1
+            If Not allow.ValueAt(i).IsString() Then
+                Throw New Exception("files must contain strings")
+            End If
+            CollectFiles(root, allow.ValueAt(i).AsString().Value, selected)
+        Next
+    Else
+        For Each relative As String In ["modules", "declares", "resources", "link", "runtime", "LICENSE", "LICENSE.md", "README.md"]
+            Dim candidate As New FileSystemItem(Path.Join(root, relative))
+            If candidate.Exists() Then
+                CollectFiles(root, relative, selected)
+            End If
+        Next
+    End If
+    Dim files As Array Of String = []
+    For Each key As String In selected.Keys()
+        Array.Append(files, selected.Value(key).AsString().Value)
+    Next
+    Array.Sort(files)
+    Dim totalBytes As Integer = 0
+    If files.Count > 20000 Then
+        Throw New Exception("Package exceeds the 20000-file limit")
+    End If
+    For Each relative As String In files
+        Dim item As New FileSystemItem(Path.Join(root, relative))
+        totalBytes += item.Length()
+        If totalBytes > 1073741824 Then
+            Throw New Exception("Package exceeds the 1 GiB input limit")
+        End If
+    Next
+    Return files
+End Function
+
+Function PackageMetadata(root As String) As JSONItem
+    Dim value As JSONItem = LoadObject(Path.Join(root, "manifest.json"))
+    Dim name As String = RequiredString(value, "name")
+    If Not Identifier(name) Then
+        Throw New Exception("Package name must be a Buoy identifier: " + name)
+    End If
+    Dim version As String = RequiredString(value, "version")
+    ParseVersion(version)
+    For Each character As String In String.Chars(version)
+        If Not String.Contains("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-+", character, True) Then
+            Throw New Exception("Unsafe package version: " + version)
+        End If
+    Next
+    If value.Value("schema").AsNumber().Or(0.0) <> 1.0 Then
+        Throw New Exception("Unsupported package schema")
+    End If
+    Return value
+End Function
+
+Function Seal(root As String, destination As String, settings As JSONItem) As JSONItem
+    Dim metadata As JSONItem = PackageMetadata(root)
+    Dim files As Array Of String = PackageFiles(root, settings)
+    ValidatePackagePlan(metadata, files)
+    Dim work As String = Temporary()
+    Try
+        Dim stage As String = Path.Join(work, "package")
+        MakeDirectory(stage)
+        Dim payload As New JSONItem
+        For Each relative As String In files
+            CopyFile(Path.Join(root, relative), Path.Join(stage, relative))
+            payload.Value(relative) = SHA256(Path.Join(stage, relative))
+        Next
+        ' Validate declared payload paths against the allowlist before sealing.
+        For Each field As String In ["modules", "declares", "resources"]
+            Dim paths As JSONItem = metadata.Value(field)
+            For i As Integer = 0 To paths.Count() - 1
+                Dim relative As String = paths.ValueAt(i).AsString().Or("")
+                RelativePath(relative)
+                Dim item As New FileSystemItem(Path.Join(stage, relative))
+                If Not item.IsFile() Then
+                    Throw New Exception("Allowlist omits declared payload: " + relative)
+                End If
+            Next
+        Next
+        ' The compiler owns the final per-file hashes and archive digest.
+        metadata.Remove("files")
+        metadata.Remove("digest")
+        SaveObject(Path.Join(stage, "manifest.json"), metadata)
+        payload.Value("manifest.json") = SHA256(Path.Join(stage, "manifest.json"))
+        ' ZIP entries retain source mtimes. Normalize the private stage so a
+        ' locked source snapshot can recreate identical archive bytes later.
+        NormalizeTimes(stage)
+        Dim sealerEnvironment As JSONItem = JSONItem.NewObject()
+        sealerEnvironment.Value("TZ") = "UTC"
+        RunCommand([Packager(), "pkg", "seal", stage, "-o", Path.Join(work, "sealed.buipkg")], sealerEnvironment)
+        CopyFile(Path.Join(work, "sealed.buipkg"), destination)
+        Dim entry As New JSONItem
+        entry.Value("name") = RequiredString(metadata, "name")
+        entry.Value("version") = RequiredString(metadata, "version")
+        entry.Value("sha256") = SHA256(destination)
+        entry.Value("inputs") = payload
+        Return entry
+    Finally
+        RemoveTemporary(work)
+    End Try
+End Function
+
+Function GitCommand(arguments As Array Of String, outputLimit As Integer = 16777216, fileLimit As Integer = 0) As String
+    Dim environment As JSONItem = JSONItem.NewObject()
+    For Each name As String In ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_TEMPLATE_DIR", "GIT_SSH_COMMAND", "GIT_SSH", "GIT_SSH_VARIANT", "GIT_EXEC_PATH", "GIT_SSL_NO_VERIFY", "GIT_ALLOW_PROTOCOL", "GIT_PROTOCOL", "GIT_PROXY_COMMAND", "GIT_ASKPASS", "SSH_ASKPASS"]
+        environment.Value(name) = JSONItem.Null()
+    Next
+    environment.Value("GIT_CONFIG_NOSYSTEM") = "1"
+    environment.Value("GIT_CONFIG_GLOBAL") = NullDevice()
+    environment.Value("GIT_TERMINAL_PROMPT") = "0"
+    environment.Value("SSH_ASKPASS_REQUIRE") = "never"
+    Dim options As Array Of String = ["git", "-c", "init.templateDir=", "-c", "http.followRedirects=false", "-c", "core.hooksPath=" + NullDevice(), "-c", "protocol.allow=never", "-c", "protocol.ext.allow=never", "-c", "protocol.file.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always"]
+    Return RunCommand(AppendArguments(options, arguments), environment, outputLimit, fileLimit)
+End Function
+
+Function NullDevice() As String
+    #If TargetWindows Then
+        Return "NUL"
+    #Else
+        Return "/dev/null"
+    #End If
+End Function
+
+Sub ValidateSource(source As JSONItem)
+    If Not source.IsObject() Then
+        Throw New Exception("Dependency source must be an object")
+    End If
+    For Each key As String In source.Keys()
+        If key <> "path" And key <> "git" And key <> "rev" And key <> "subdir" And key <> "version" And key <> "archive" And key <> "registry" And key <> "package" Then
+            Throw New Exception("Unsupported source field: " + key)
+        End If
+    Next
+    If source.HasKey("archive") Then
+        RequiredString(source, "archive")
+        If source.Count() <> 1 Then
+            Throw New Exception("archive cannot be combined with other source fields")
+        End If
+    ElseIf source.HasKey("registry") Then
+        RequiredString(source, "registry")
+        ParseVersion(RequiredString(source, "version"))
+        If source.Count() <> 2 And Not (source.Count() = 3 And source.HasKey("package")) Then
+            Throw New Exception("registry source requires registry, version and optional package coordinate")
+        End If
+    ElseIf source.HasKey("path") Then
+        RequiredString(source, "path")
+        If source.Count() <> 1 Then
+            Throw New Exception("path cannot be combined with git/rev/subdir")
+        End If
+    Else
+        Dim url As String = RequiredString(source, "git")
+        If Not String.StartsWith(url, "https://", True) And Not String.StartsWith(url, "ssh://", True) Then
+            Throw New Exception("Git sources require explicit https:// or ssh:// URLs; use path for local sources")
+        End If
+        If String.StartsWith(url, "https://", True) And String.Contains(url, "@", True) Then
+            Throw New Exception("Do not embed credentials in source URLs; use SSH for private repositories")
+        End If
+        Dim authority As String = String.Split(String.Split(url, "://")(1), "/")(0)
+        If authority = "" Then
+            Throw New Exception("Git URL requires a hostname")
+        End If
+        If String.Contains(authority, "@", True) And String.Contains(String.Split(authority, "@")(0), ":", True) Then
+            Throw New Exception("Do not embed passwords in Git URLs")
+        End If
+        For Each character As String In String.Chars(url)
+            If Not String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/@._-+~%", character, True) Then
+                Throw New Exception("Unsupported character in git URL")
+            End If
+        Next
+        If source.HasKey("version") = source.HasKey("rev") Then
+            Throw New Exception("Git source requires exactly one of rev or version")
+        End If
+        Dim revision As String
+        If source.HasKey("version") Then
+            revision = RequiredString(source, "version")
+            ParseVersion(revision)
+        Else
+            revision = RequiredString(source, "rev")
+        End If
+        If String.StartsWith(revision, "-", True) Then
+            Throw New Exception("Invalid git revision")
+        End If
+        For Each character As String In String.Chars(revision)
+            If Not String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-+", character, True) Then
+                Throw New Exception("Use a commit, branch, or tag as rev")
+            End If
+        Next
+        If source.HasKey("subdir") Then
+            RelativePath(RequiredString(source, "subdir"))
+        End If
+    End If
+End Sub
+
+Function FetchSource(source As JSONItem, owner As String, work As String) As JSONItem
+    ValidateSource(source)
+    Dim origin As New JSONItem
+    If source.HasKey("path") Then
+        Dim localPath As String = RequiredString(source, "path")
+        If Not IsAbsolute(localPath) Then
+            localPath = Path.Join(owner, localPath)
+        End If
+        origin.Value("path") = RootPath(localPath)
+        origin.Value("kind") = "path"
+        Return origin
+    End If
+    Dim repo As String = Path.Join(work, "repo.git")
+    Dim tree As String = Path.Join(work, "tree")
+    GitCommand(["init", "--bare", "--quiet", repo])
+    Dim atRepo As Array Of String = ["--git-dir=" + repo]
+    Dim url As String = RequiredString(source, "git")
+    Dim revision As String
+    If source.HasKey("version") Then
+        revision = "v" + RequiredString(source, "version")
+        If source.HasKey("subdir") Then
+            revision = RequiredString(source, "subdir") + "/" + revision
+        End If
+    Else
+        revision = RequiredString(source, "rev")
+    End If
+    Dim isTag As Boolean = source.HasKey("version") Or String.StartsWith(revision, "refs/tags/", True)
+    If isTag And Not String.StartsWith(revision, "refs/tags/", True) Then
+        revision = "refs/tags/" + revision
+    End If
+    ' No checkout: git archive avoids checkout hooks, filters and LFS smudging.
+    #If TargetWindows Then
+        ' Windows has no RLIMIT_FSIZE. The selected tree is still checked below;
+        ' a fetch-time disk quota must be enforced by the deployment filesystem.
+        GitCommand(AppendArguments(atRepo, ["fetch", "--quiet", "--no-tags", "--depth=1", "--", url, revision]))
+    #Else
+        GitCommand(AppendArguments(atRepo, ["fetch", "--quiet", "--no-tags", "--depth=1", "--", url, revision]), 16777216, 1073741824)
+    #End If
+    Dim commit As String = GitCommand(AppendArguments(atRepo, ["rev-parse", "--verify", "FETCH_HEAD^{commit}"]))
+    Dim subdir As String = source.Value("subdir").AsString().Or("")
+    Dim pathArguments As Array Of String = []
+    If subdir <> "" Then Array.Append(pathArguments, subdir)
+    Dim treeArguments As Array Of String = AppendArguments(atRepo, ["ls-tree", "-r", "-l", commit, "--"])
+    Dim listing As String = GitCommand(AppendArguments(treeArguments, pathArguments), 2097152)
+    Dim count As Integer = 0
+    Dim total As Integer = 0
+    For Each line As String In String.Split(listing, "\n")
+        If String.Trim(line) = "" Then
+            Continue For
+        End If
+        count += 1
+        If String.StartsWith(line, "120000 ", True) Or String.StartsWith(line, "160000 ", True) Then
+            Throw New Exception("Git symlinks and submodules are not supported")
+        End If
+        Dim fields As Array Of String = String.Split(String.Trim(String.Split(line, "\t")(0)), " ")
+        Dim size As Integer = Integer.Parse(fields(fields.Count - 1)).Or(-1)
+        If size < 0 Or size > 1073741824 Then
+            Throw New Exception("Invalid or oversized Git blob")
+        End If
+        total += size
+        If count > 20000 Or total > 1073741824 Then
+            Throw New Exception("Git package exceeds file-count or byte limits")
+        End If
+    Next
+    MakeDirectory(tree)
+    GitCommand(AppendArguments(AppendArguments(atRepo, ["archive", "--format=tar", "--output=" + Path.Join(work, "tree.tar"), commit, "--"]), pathArguments))
+    Command(["tar", "-xf", Path.Join(work, "tree.tar"), "-C", tree])
+    If subdir <> "" Then
+        tree = Path.Join(tree, subdir)
+    End If
+    origin.Value("kind") = "git"
+    origin.Value("git") = url
+    origin.Value("rev") = revision
+    origin.Value("isTag") = isTag
+    origin.Value("commit") = commit
+    origin.Value("subdir") = subdir
+    origin.Value("path") = tree
+    Return origin
+End Function
+
+Function SourceKey(source As JSONItem, owner As String, name As String) As String
+    Dim identity As JSONItem = Json.Parse(Canonical(source))
+    identity.Remove("version")
+    If source.HasKey("registry") Then
+        identity.Value("package") = RegistryCoordinate(source, name)
+    End If
+    If source.HasKey("path") Or source.HasKey("archive") Or source.HasKey("registry") Then
+        Dim field As String = "path"
+        If source.HasKey("archive") Then
+            field = "archive"
+        ElseIf source.HasKey("registry") Then
+            field = "registry"
+        End If
+        Dim location As String = RequiredString(source, field)
+        If field = "registry" And String.StartsWith(location, "https://", True) Then
+            identity.Value(field) = RegistryLocation(location, owner)
+            Return Canonical(identity)
+        End If
+        If Not IsAbsolute(location) Then
+            location = Path.Join(owner, location)
+        End If
+        If field = "registry" And String.StartsWith(location, "https://", True) Then
+            identity.Value(field) = location
+            Return Canonical(identity)
+        ElseIf field = "archive" Then
+            Dim item As New FileSystemItem(location)
+            location = Path.Join(RootPath(item.ParentPath()), item.Name())
+        Else
+            location = RootPath(location)
+        End If
+        identity.Value(field) = location
+    End If
+    Return Canonical(identity)
+End Function
+
+Sub Snapshot(root As String, settings As JSONItem, origin As JSONItem, entry As JSONItem, cache As String)
+    Dim contents As JSONItem = JSONItem.NewObject()
+    Dim files As Array Of String = PackageFiles(root, settings)
+    For Each relative As String In files
+        contents.Value(relative) = SHA256(Path.Join(root, relative))
+    Next
+    Dim snapshotId As String = HashText(Canonical(contents))
+    Dim parent As New FileSystemItem(cache)
+    Dim state As String = parent.ParentPath()
+    Dim relativeCache As String = "sources/" + snapshotId
+    If origin.Value("kind").AsString().Or("") = "git" Then
+        relativeCache = "git/" + HashText(RequiredString(origin, "git") + "/" + origin.Value("subdir").AsString().Or("")) + "/" + RequiredString(origin, "commit")
+    End If
+    Dim destination As String = Path.Join(state, relativeCache)
+    NoSymlink(state)
+    NoPathSymlinks(state, relativeCache)
+    MakeDirectory(destination)
+    For Each relative As String In files
+        NoPathSymlinks(state, relativeCache + "/" + relative)
+        Dim item As New FileSystemItem(Path.Join(destination, relative))
+        If item.Exists() Then
+            If String.Compare(SHA256(item.FullPath()), contents.Value(relative).AsString().Value, True) <> 0 Then
+                Throw New Exception("Immutable source cache was modified: " + item.FullPath())
+            End If
+        Else
+            CopyFile(Path.Join(root, relative), item.FullPath())
+        End If
+    Next
+    entry.Value("snapshot") = relativeCache
+    entry.Value("sourceFiles") = contents
+End Sub
+
+Function NormalizeDependencies(dependencies As JSONItem, owner As String, kind As String, replacements As JSONItem) As JSONItem
+    Dim normalized As JSONItem = JSONItem.NewObject()
+    Dim seen As JSONItem = JSONItem.NewObject()
+    If dependencies.IsNull() Then
+        Return normalized
+    End If
+    If Not dependencies.IsObject() Then
+        Throw New Exception("Dependencies must be an object")
+    End If
+    For Each name As String In dependencies.Keys()
+        If Not Identifier(name) Then
+            Throw New Exception("Invalid dependency name: " + name)
+        End If
+        If seen.HasKey(String.LCase(name)) Then
+            Throw New Exception("Case-colliding dependency identities: " + name)
+        End If
+        seen.Value(String.LCase(name)) = True
+        Dim source As JSONItem = Json.Parse(Canonical(dependencies.Value(name)))
+        ValidateSource(source)
+        Dim overridden As Boolean = replacements.HasKey(String.LCase(name))
+        If (kind = "git" Or kind = "registry") And (source.HasKey("path") Or source.HasKey("archive")) And Not overridden Then
+            Throw New Exception("Published/Git packages cannot impose local dependency paths: " + name)
+        End If
+        For Each field As String In ["path", "archive", "registry"]
+            If source.HasKey(field) Then
+                Dim location As String = RequiredString(source, field)
+                If Not IsAbsolute(location) And Not String.StartsWith(location, "https://", True) Then
+                    If (kind = "git" Or kind = "registry") And Not overridden Then
+                        Throw New Exception("Published/Git packages require absolute registry origins: " + name)
+                    End If
+                    source.Value(field) = Path.Join(owner, location)
+                End If
+            End If
+        Next
+        normalized.Value(name) = source
+    Next
+    Return normalized
+End Function
+
+Function LoadDependency(name As String, source As JSONItem, owner As String, replacements As JSONItem, cache As String) As JSONItem
+    Dim signature As String = SourceKey(source, owner, name)
+    Dim work As String = Temporary()
+    Try
+        Dim entry As JSONItem
+        If source.HasKey("archive") Or source.HasKey("registry") Then
+            entry = AcquireArchive(name, source, owner, work, cache)
+            entry.Value("dependencies") = NormalizeDependencies(entry.Value("dependencies"), owner, "registry", replacements)
+        Else
+            Dim origin As JSONItem = FetchSource(source, owner, work)
+            Dim packageRoot As String = RequiredString(origin, "path")
+            Dim settings As JSONItem = JSONItem.NewObject()
+            Dim config As New FileSystemItem(Path.Join(packageRoot, "bpm.json"))
+            If config.IsFile() Then
+                settings = Manifest(packageRoot)
+            End If
+            Dim metadata As JSONItem = PackageMetadata(packageRoot)
+            If RequiredString(metadata, "name") <> name Then
+                Throw New Exception("Dependency " + name + " exports a different package name")
+            End If
+            If source.HasKey("version") And String.Compare(RequiredString(source, "version"), RequiredString(metadata, "version"), True) <> 0 Then
+                Throw New Exception("Version tag and package manifest disagree: " + name)
+            End If
+            Dim dependencies As JSONItem = NormalizeDependencies(settings.Value("dependencies"), packageRoot, RequiredString(origin, "kind"), replacements)
+            entry = Seal(packageRoot, Path.Join(work, "artifact.buipkg"), settings)
+            Snapshot(packageRoot, settings, origin, entry, cache)
+            StoreArtifact(Path.Join(work, "artifact.buipkg"), cache, RequiredString(entry, "sha256"))
+            If origin.Value("kind").AsString().Or("") = "git" Then
+                origin.Remove("path")
+            End If
+            entry.Value("source") = origin
+            entry.Value("dependencies") = dependencies
+        End If
+        entry.Value("request") = signature
+        entry.Value("replaced") = replacements.HasKey(String.LCase(name))
+        Return entry
+    Finally
+        RemoveTemporary(work)
+    End Try
+End Function
+
+Sub AddRequirement(name As String, source As JSONItem, owner As String, parentKey As String, requirements As JSONItem)
+    name = String.LCase(name)
+    If Not requirements.HasKey(name) Then
+        requirements.Value(name) = JSONItem.NewObject()
+    End If
+    Dim request As JSONItem = JSONItem.NewObject()
+    request.Value("source") = source
+    request.Value("owner") = owner
+    requirements.Value(name).Value(parentKey) = request
+End Sub
+
+Sub GatherNode(name As String, graph As JSONItem, requirements As JSONItem, visited As JSONItem, root As String)
+    name = String.LCase(name)
+    If visited.HasKey(name) Or Not graph.HasKey(name) Then
+        Return
+    End If
+    visited.Value(name) = True
+    For Each child As String In graph.Value(name).Value("dependencies").Keys()
+        AddRequirement(child, graph.Value(name).Value("dependencies").Value(child), root, name, requirements)
+        GatherNode(child, graph, requirements, visited, root)
+    Next
+End Sub
+
+Function GatherRequirements(roots As JSONItem, graph As JSONItem, root As String) As JSONItem
+    Dim requirements As JSONItem = JSONItem.NewObject()
+    Dim visited As JSONItem = JSONItem.NewObject()
+    For Each key As String In roots.Keys()
+        Dim request As JSONItem = roots.Value(key)
+        AddRequirement(RequiredString(request, "name"), request.Value("source"), RequiredString(request, "owner"), key, requirements)
+    Next
+    For Each key As String In roots.Keys()
+        GatherNode(RequiredString(roots.Value(key), "name"), graph, requirements, visited, root)
+    Next
+    Return requirements
+End Function
+
+Function SelectRequirement(name As String, requirements As JSONItem, replacements As JSONItem) As JSONItem
+    Dim selected As JSONItem = JSONItem.NewObject()
+    Dim signature As String = ""
+    For Each parentKey As String In requirements.Keys()
+        Dim request As JSONItem = requirements.Value(parentKey)
+        ValidateSource(request.Value("source"))
+        Dim source As JSONItem = request.Value("source")
+        Dim owner As String = RequiredString(request, "owner")
+        If replacements.HasKey(name) Then
+            source = replacements.Value(name)
+            owner = RequiredString(replacements, "_root")
+        End If
+        ValidateSource(source)
+        CheckSourcePolicy(source, replacements)
+        Dim identity As String = SourceKey(source, owner, name)
+        If signature <> "" And String.Compare(signature, identity, True) <> 0 Then
+            Throw New Exception("Conflicting exact sources for " + name + "; use one root replacement")
+        End If
+        If signature = "" Then
+            signature = identity
+            selected.Value("source") = source
+            selected.Value("owner") = owner
+        ElseIf source.HasKey("version") Then
+            Dim required As String = RequiredString(source, "version")
+            Dim current As String = RequiredString(selected.Value("source"), "version")
+            If ParseVersion(required).Value("core").ValueAt(0).AsString().Value <> ParseVersion(current).Value("core").ValueAt(0).AsString().Value Then
+                Throw New Exception("Incompatible major versions of " + name + "; distinct package identities are required")
+            End If
+            Dim order As Integer = CompareVersion(required, current)
+            If order = 0 And String.Compare(required, current, True) <> 0 Then
+                Throw New Exception("Conflicting build-metadata variants of " + name)
+            End If
+            If order > 0 Then
+                selected.Value("source") = source
+                selected.Value("owner") = owner
+            End If
+        End If
+    Next
+    Return selected
+End Function
+
+Function ResolveGraph(root As String, settings As JSONItem, members As JSONItem, replacements As JSONItem, cache As String) As JSONItem
+    Dim roots As JSONItem = JSONItem.NewObject()
+    Dim owners As JSONItem = JSONItem.NewObject()
+    owners.Value("root") = root
+    For Each relative As String In members.Keys()
+        owners.Value("workspace:" + relative) = Path.Join(root, relative)
+    Next
+    For Each parentKey As String In owners.Keys()
+        Dim owner As String = RequiredString(owners, parentKey)
+        Dim config As JSONItem = settings
+        If parentKey <> "root" Then
+            config = members.Value(String.Substring(parentKey, 10))
+        End If
+        For Each name As String In config.Value("dependencies").Keys()
+            Dim request As JSONItem = JSONItem.NewObject()
+            request.Value("name") = String.LCase(name)
+            request.Value("source") = config.Value("dependencies").Value(name)
+            request.Value("owner") = owner
+            roots.Value(parentKey + ":" + String.LCase(name)) = request
+        Next
+    Next
+    Dim graph As JSONItem = JSONItem.NewObject()
+    Dim loaded As JSONItem = JSONItem.NewObject()
+    Dim states As JSONItem = JSONItem.NewObject()
+    For round As Integer = 1 To 256
+        Dim requirements As JSONItem = GatherRequirements(roots, graph, root)
+        Dim state As String = HashText(Canonical(requirements))
+        If states.HasKey(state) Then
+            Throw New Exception("Dependency resolution does not converge: selected-version requirements repeat")
+        End If
+        states.Value(state) = True
+        If requirements.Count() > 4096 Then
+            Throw New Exception("Dependency graph exceeds the 4096-package limit")
+        End If
+        Dim nextGraph As JSONItem = JSONItem.NewObject()
+        Dim errors As JSONItem = JSONItem.NewObject()
+        Dim names As Array Of String = requirements.Keys()
+        Array.Sort(names)
+        For Each name As String In names
+            Try
+                Dim request As JSONItem = SelectRequirement(name, requirements.Value(name), replacements)
+                Dim source As JSONItem = request.Value("source")
+                Dim owner As String = RequiredString(request, "owner")
+                Dim key As String = name + "|" + SourceKey(source, owner, name) + "|" + source.Value("version").AsString().Or("")
+                If Not loaded.HasKey(key) Then
+                    loaded.Value(key) = LoadDependency(name, source, owner, replacements, cache)
+                End If
+                nextGraph.Value(name) = loaded.Value(key)
+            Catch e As Exception
+                ' A later-selected parent may remove this requirement entirely.
+                ' Keep exploring other parents; fail only on stable live errors.
+                errors.Value(name) = e.Message
+            End Try
+        Next
+        Dim following As JSONItem = GatherRequirements(roots, nextGraph, root)
+        If String.Compare(Canonical(requirements), Canonical(following), True) = 0 Then
+            If errors.Count() > 0 Then
+                Dim namesWithErrors As Array Of String = errors.Keys()
+                Array.Sort(namesWithErrors)
+                Throw New Exception(RequiredString(errors, namesWithErrors(0)))
+            End If
+            Dim active As JSONItem = JSONItem.NewObject()
+            Dim visited As JSONItem = JSONItem.NewObject()
+            For Each name As String In nextGraph.Keys()
+                ValidateLockedGraph(name, nextGraph, active, visited)
+            Next
+            Return nextGraph
+        End If
+        graph = nextGraph
+    Next
+    Throw New Exception("Dependency resolution did not converge within 256 rounds")
+End Function
+
+Sub ReleaseWriters(writers As Array Of String)
+    For Each guard As String In writers
+        DiscardGuard(guard)
+    Next
+End Sub
+
+Function ClaimWorkspaceWriters(root As String, members As JSONItem) As Array Of String
+    Dim writers As Array Of String = []
+    Try
+        For Each relative As String In members.Keys()
+            Dim memberRoot As String = Path.Join(root, relative)
+            Dim state As String = Path.Join(memberRoot, ".bpm")
+            NoSymlink(state)
+            MakeDirectory(state)
+            Dim guard As New FileSystemItem(Path.Join(state, "write-lock"))
+            If guard.Exists() Then
+                Dim owner As New FileSystemItem(Path.Join(guard.FullPath(), "owner"))
+                Dim scopeFile As New FileSystemItem(Path.Join(guard.FullPath(), "workspace"))
+                If owner.IsFile() And scopeFile.IsFile() Then
+                    If String.Compare(ReadText(owner.FullPath()), Str(BPMProcessID()), True) = 0 And String.Compare(ReadText(scopeFile.FullPath()), RootPath(root), True) = 0 Then
+                        Continue For
+                    End If
+                End If
+                Throw New Exception("Workspace member is busy or needs repair: " + relative)
+            End If
+            ExclusiveDirectory(guard.FullPath())
+            Array.Append(writers, guard.FullPath())
+            WriteText(Path.Join(guard.FullPath(), "owner"), Str(BPMProcessID()))
+            WriteText(Path.Join(guard.FullPath(), "workspace"), RootPath(root))
+        Next
+        Dim projects As Array Of String = []
+        Array.Append(projects, root)
+        For Each relative As String In members.Keys()
+            Array.Append(projects, Path.Join(root, relative))
+        Next
+        For Each project As String In projects
+            Dim destination As String = PackageDirectory(project, False)
+            Dim guard As New FileSystemItem(Path.Join(destination, ".bpm-install-guard"))
+            If guard.Exists() Then
+                Throw New Exception("Workspace package destination is busy or needs repair: " + destination)
+            End If
+        Next
+        Return writers
+    Catch e As Exception
+        ReleaseWriters(writers)
+        Throw e
+    End Try
+End Function
+
+Function MetadataTargets(root As String) As JSONItem
+    Dim targets As JSONItem = JSONItem.NewObject()
+    targets.Value("bpm.json") = True
+    targets.Value("bpm.lock") = True
+    For Each relative As String In WorkspaceMembers(root, Manifest(root)).Keys()
+        targets.Value(relative + "/bpm.lock") = True
+    Next
+    Return targets
+End Function
+
+Function MetadataSnapshot(root As String, slot As String, targets As JSONItem) As String
+    Dim work As String = Path.Join(root, ".bpm/write-lock/" + slot)
+    NoPathSymlinks(root, ".bpm/write-lock/" + slot)
+    ExclusiveDirectory(work)
+    Dim journal As JSONItem = JSONItem.NewObject()
+    journal.Value("root") = RootPath(root)
+    Dim entries As JSONItem = JSONItem.NewArray()
+    Dim allowed As JSONItem = MetadataTargets(root)
+    For Each relative As String In targets.Keys()
+        If Not allowed.HasKey(relative) Then Throw New Exception("Unsafe metadata snapshot target: " + relative)
+        NoPathSymlinks(root, relative)
+        Dim file As New FileSystemItem(Path.Join(root, relative))
+        If file.Exists() And Not file.IsFile() Then Throw New Exception("Metadata destination is not a file: " + relative)
+        Dim entry As JSONItem = JSONItem.NewObject()
+        entry.Value("relative") = relative
+        entry.Value("existed") = file.IsFile()
+        If file.IsFile() Then
+            Dim backup As String = Path.Join(work, Str(entries.Count()) + ".old")
+            CopyFile(file.FullPath(), backup)
+            entry.Value("sha256") = SHA256(backup)
+        End If
+        entries.Add(entry)
+    Next
+    journal.Value("files") = entries
+    SaveObject(Path.Join(work, "restore.json"), journal)
+    ' No destination is modified before the complete backup set is discoverable.
+    WriteText(Path.Join(work, "prepared"), "yes")
+    Return work
+End Function
+
+Sub RestoreMetadata(root As String, slot As String)
+    Dim work As String = Path.Join(root, ".bpm/write-lock/" + slot)
+    NoPathSymlinks(root, ".bpm/write-lock/" + slot)
+    Dim folder As New FileSystemItem(work)
+    If Not folder.Exists() Then Return
+    Dim prepared As New FileSystemItem(Path.Join(work, "prepared"))
+    Dim committed As New FileSystemItem(Path.Join(work, "committed"))
+    NoSymlink(committed.FullPath())
+    If Not prepared.Exists() Or committed.IsFile() Then
+        ' Preparation never changes destinations; committed snapshots need no undo.
+        DiscardGuard(work)
+        Return
+    End If
+    NoSymlink(prepared.FullPath())
+    NoSymlink(Path.Join(work, "restore.json"))
+    Dim journal As JSONItem = LoadObject(Path.Join(work, "restore.json"))
+    If String.Compare(RequiredString(journal, "root"), RootPath(root), True) <> 0 Then
+        Throw New Exception("Metadata recovery belongs to another project")
+    End If
+    Dim entries As JSONItem = journal.Value("files")
+    Dim allowed As JSONItem = MetadataTargets(root)
+    Dim seen As JSONItem = JSONItem.NewObject()
+    If Not entries.IsArray() Or entries.Count() > allowed.Count() Then Throw New Exception("Invalid metadata recovery set")
+    ' Validate the complete journal and every backup before changing any target.
+    For i As Integer = 0 To entries.Count() - 1
+        Dim entry As JSONItem = entries.ValueAt(i)
+        Dim relative As String = RequiredString(entry, "relative")
+        If Not allowed.HasKey(relative) Or seen.HasKey(relative) Or Not entry.Value("existed").IsBoolean() Then
+            Throw New Exception("Unsafe metadata recovery target: " + relative)
+        End If
+        seen.Value(relative) = True
+        NoPathSymlinks(root, relative)
+        Dim file As New FileSystemItem(Path.Join(root, relative))
+        If file.Exists() And Not file.IsFile() Then Throw New Exception("Metadata recovery target is not a file: " + relative)
+        If entry.Value("existed").AsBoolean().Value Then
+            Dim backup As String = Path.Join(work, Str(i) + ".old")
+            NoSymlink(backup)
+            Dim digest As String = RequiredString(entry, "sha256")
+            ValidateHex(digest, 64, "metadata backup SHA-256")
+            If String.Compare(SHA256(backup), digest, True) <> 0 Then Throw New Exception("Metadata recovery backup hash mismatch")
+        End If
+    Next
+    For i As Integer = 0 To entries.Count() - 1
+        Dim entry As JSONItem = entries.ValueAt(i)
+        Dim filename As String = Path.Join(root, RequiredString(entry, "relative"))
+        If entry.Value("existed").AsBoolean().Value Then
+            Dim backup As String = Path.Join(work, Str(i) + ".old")
+            Dim target As New FileSystemItem(filename)
+            Dim unchanged As Boolean = False
+            If target.IsFile() Then unchanged = String.Compare(SHA256(filename), RequiredString(entry, "sha256"), True) = 0
+            If Not unchanged Then AtomicCopy(backup, filename)
+        Else
+            Dim target As New FileSystemItem(filename)
+            If target.Exists() And Not target.Delete() Then Throw New Exception("Cannot roll back metadata: " + filename)
+        End If
+    Next
+    DiscardGuard(work)
+End Sub
+
+Sub CommitMetadata(root As String, documents As JSONItem)
+    Dim targets As JSONItem = JSONItem.NewObject()
+    Dim allowed As JSONItem = MetadataTargets(root)
+    For Each destination As String In documents.Keys()
+        Dim found As Boolean = False
+        For Each relative As String In allowed.Keys()
+            If String.Compare(destination, Path.Join(root, relative), True) = 0 Then
+                targets.Value(relative) = True
+                found = True
+            End If
+        Next
+        If Not found Then Throw New Exception("Unsafe metadata destination: " + destination)
+    Next
+    Dim work As String = MetadataSnapshot(root, "metadata", targets)
+    Try
+        Dim index As Integer = 0
+        For Each destination As String In documents.Keys()
+            Dim stage As String = Path.Join(work, Str(index) + ".new")
+            SaveObject(stage, documents.Value(destination))
+            AtomicCopy(stage, destination)
+            index += 1
+        Next
+        WriteText(Path.Join(work, "committed"), "yes")
+        DiscardGuard(work)
+    Catch e As Exception
+        Try
+            RestoreMetadata(root, "metadata")
+        Catch recovery As Exception
+            StdErr.WriteLine("Metadata rollback incomplete; backups retained at " + work)
+            Throw New Exception(e.Message + "; metadata rollback incomplete: " + recovery.Message)
+        End Try
+        Throw e
+    End Try
+End Sub
+
+Sub Resolve(root As String)
+    Dim existingMemberLock As New FileSystemItem(Path.Join(root, "bpm.lock"))
+    If existingMemberLock.IsFile() And LoadObject(existingMemberLock.FullPath()).HasKey("workspace") Then
+        Throw New Exception("Resolve workspace dependencies at the workspace root")
+    End If
+    Dim settings As JSONItem = Manifest(root)
+    Dim members As JSONItem = WorkspaceMembers(root, settings)
+    Dim writers As Array Of String = ClaimWorkspaceWriters(root, members)
+    Try
+    Dim replacements As New JSONItem
+    For Each name As String In settings.Value("replace").Keys()
+        Dim folded As String = String.LCase(name)
+        If replacements.HasKey(folded) Then
+            Throw New Exception("Case-colliding replacements: " + name)
+        End If
+        replacements.Value(folded) = settings.Value("replace").Value(name)
+    Next
+    replacements.Value("_root") = root
+    If settings.HasKey("allowHosts") And Not settings.Value("allowHosts").IsArray() Then
+        Throw New Exception("allowHosts must be an array of hostnames")
+    End If
+    replacements.Value("_hosts") = settings.Value("allowHosts")
+    Dim workspacePackages As JSONItem = JSONItem.NewObject()
+    For Each relative As String In members.Keys()
+        Dim packageFile As New FileSystemItem(Path.Join(root, relative + "/manifest.json"))
+        If packageFile.IsFile() Then
+            Dim name As String = String.LCase(RequiredString(PackageMetadata(Path.Join(root, relative)), "name"))
+            If workspacePackages.HasKey(name) Then
+                Throw New Exception("Duplicate workspace package identity: " + name)
+            End If
+            workspacePackages.Value(name) = relative
+            If Not replacements.HasKey(name) Then
+                Dim source As JSONItem = JSONItem.NewObject()
+                source.Value("path") = Path.Join(root, relative)
+                replacements.Value(name) = source
+            End If
+        End If
+    Next
+    Dim cache As String = Path.Join(root, ".bpm/artifacts")
+    NoPathSymlinks(root, ".bpm/artifacts")
+    MakeDirectory(cache)
+    Dim graph As JSONItem = ResolveGraph(root, settings, members, replacements, cache)
+    Dim oldFile As New FileSystemItem(Path.Join(root, "bpm.lock"))
+    If oldFile.IsFile() Then
+        Dim previous As JSONItem = LoadObject(oldFile.FullPath()).Value("packages")
+        For Each name As String In graph.Keys()
+            Dim origin As JSONItem = graph.Value(name).Value("source")
+            Dim oldOrigin As JSONItem = previous.Value(name).Value("source")
+            If origin.Value("isTag").AsBoolean().Or(False) And oldOrigin.Value("isTag").AsBoolean().Or(False) Then
+                If String.Compare(origin.Value("git").AsString().Or(""), oldOrigin.Value("git").AsString().Or(""), True) = 0 And String.Compare(origin.Value("rev").AsString().Or(""), oldOrigin.Value("rev").AsString().Or(""), True) = 0 Then
+                    If String.Compare(RequiredString(origin, "commit"), RequiredString(oldOrigin, "commit"), True) <> 0 Then
+                        Throw New Exception("Release tag moved for " + name + "; pin the reviewed commit explicitly instead")
+                    End If
+                End If
+            End If
+        Next
+    End If
+    Dim lock As New JSONItem
+    lock.Value("schema") = 1.0
+    lock.Value("resolver") = "live-minimum-v1"
+    lock.Value("manifestSHA256") = ProjectFingerprint(root)
+    lock.Value("compiler") = Command([System.EnvironmentVariable("BPM_BUOY").Or("buoy"), "--version"])
+    lock.Value("sealer") = Command([Packager(), "--version"])
+    lock.Value("packages") = graph
+    lock.Value("members") = members
+    Dim install As JSONItem = JSONItem.NewArray()
+    For Each name As String In DependencyClosure(settings, graph).Keys()
+        install.Add(name)
+    Next
+    lock.Value("install") = install
+    Dim documents As JSONItem = JSONItem.NewObject()
+    documents.Value(Path.Join(root, "bpm.lock")) = lock
+        For Each relative As String In members.Keys()
+            Dim memberRoot As String = Path.Join(root, relative)
+            Dim memberLock As JSONItem = Json.Parse(Canonical(lock))
+            memberLock.Remove("members")
+            memberLock.Value("manifestSHA256") = ProjectFingerprint(memberRoot)
+            memberLock.Value("packages") = DependencyClosure(members.Value(relative), graph)
+            Dim memberInstall As JSONItem = JSONItem.NewArray()
+            For Each name As String In memberLock.Value("packages").Keys()
+                memberInstall.Add(name)
+            Next
+            memberLock.Value("install") = memberInstall
+            Dim workspace As JSONItem = JSONItem.NewObject()
+            Dim ascent As String = ""
+            For Each component As String In String.Split(relative, "/")
+                ascent += "../"
+            Next
+            workspace.Value("root") = ascent
+            workspace.Value("fingerprint") = RequiredString(lock, "manifestSHA256")
+            memberLock.Value("workspace") = workspace
+            documents.Value(Path.Join(memberRoot, "bpm.lock")) = memberLock
+        Next
+    CommitMetadata(root, documents)
+
+    Print "Locked " + Str(graph.Count()) + " package(s); run bpm sync or bpm vendor"
+    Finally
+        ReleaseWriters(writers)
+    End Try
+End Sub
+
+Sub ValidateHex(text As String, length As Integer, label As String)
+    If String.Len(text) <> length Then
+        Throw New Exception("Invalid " + label + " in lock")
+    End If
+    For Each character As String In String.Chars(text)
+        If Not String.Contains("0123456789abcdef", character, True) Then
+            Throw New Exception("Invalid " + label + " in lock")
+        End If
+    Next
+End Sub
+
+Sub ValidateLockedSource(entry As JSONItem, name As String)
+    ParseVersion(RequiredString(entry, "version"))
+    If Not entry.Value("dependencies").IsObject() Then
+        Throw New Exception("Lock dependencies must be an object: " + name)
+    End If
+    For Each child As String In entry.Value("dependencies").Keys()
+        If Not Identifier(child) Then
+            Throw New Exception("Invalid dependency identity in lock: " + child)
+        End If
+        ValidateSource(entry.Value("dependencies").Value(child))
+    Next
+    Dim origin As JSONItem = entry.Value("source")
+    If Not origin.IsObject() Then
+        Throw New Exception("Lock source must be an object: " + name)
+    End If
+    Dim kind As String = RequiredString(origin, "kind")
+    If kind = "git" Then
+        Dim source As JSONItem = JSONItem.NewObject()
+        source.Value("git") = RequiredString(origin, "git")
+        RequiredString(origin, "rev")
+        Dim commit As String = RequiredString(origin, "commit")
+        If String.Len(commit) <> 40 And String.Len(commit) <> 64 Then
+            Throw New Exception("Locked Git source requires a full commit: " + name)
+        End If
+        ValidateHex(commit, String.Len(commit), "Git commit")
+        source.Value("rev") = commit
+        Dim subdir As String = origin.Value("subdir").AsString().Or("")
+        If subdir <> "" Then
+            source.Value("subdir") = subdir
+        End If
+        ValidateSource(source)
+        If origin.HasKey("isTag") And Not origin.Value("isTag").IsBoolean() Then
+            Throw New Exception("Locked isTag must be a Boolean")
+        End If
+    ElseIf kind = "path" Then
+        RequiredString(origin, "path")
+    ElseIf kind = "archive" Then
+        RequiredString(origin, "archive")
+    ElseIf kind = "registry" Then
+        RequiredString(origin, "registry")
+        RequiredString(origin, "package")
+        RegistryCoordinate(origin, name)
+        If String.Compare(RequiredString(origin, "version"), RequiredString(entry, "version"), True) <> 0 Then
+            Throw New Exception("Locked registry version does not match package: " + name)
+        End If
+    Else
+        Throw New Exception("Unsupported locked source kind: " + kind)
+    End If
+    If entry.HasKey("snapshot") Then
+        RelativePath(RequiredString(entry, "snapshot"))
+    End If
+    If entry.HasKey("sourceFiles") Then
+        Dim files As JSONItem = entry.Value("sourceFiles")
+        If Not files.IsObject() Then
+            Throw New Exception("Lock sourceFiles must be an object")
+        End If
+        For Each relative As String In files.Keys()
+            RelativePath(relative)
+            ValidateHex(RequiredString(files, relative), 64, "source SHA-256")
+        Next
+    End If
+End Sub
+
+Sub ValidateLockedGraph(name As String, graph As JSONItem, active As JSONItem, visited As JSONItem)
+    name = String.LCase(name)
+    If active.HasKey(name) Then
+        Throw New Exception("Dependency cycle in lock: " + name)
+    End If
+    If visited.HasKey(name) Then
+        Return
+    End If
+    If Not graph.HasKey(name) Then
+        Throw New Exception("Lock dependency is absent from graph: " + name)
+    End If
+    active.Value(name) = True
+    For Each child As String In graph.Value(name).Value("dependencies").Keys()
+        ValidateLockedGraph(child, graph, active, visited)
+    Next
+    active.Remove(name)
+    visited.Value(name) = True
+End Sub
+
+Function Locked(root As String) As JSONItem
+    Dim lock As JSONItem = LoadObject(Path.Join(root, "bpm.lock"))
+    Dim resolver As String = lock.Value("resolver").AsString().Or("")
+    If lock.Value("schema").AsNumber().Or(0.0) <> 1.0 Or (resolver <> "exact-v1" And resolver <> "minimum-v1" And resolver <> "live-minimum-v1") Then
+        Throw New Exception("Unsupported lock format")
+    End If
+    If String.Compare(RequiredString(lock, "manifestSHA256"), ProjectFingerprint(root), True) <> 0 Then
+        Throw New Exception("bpm.lock is stale; run bpm resolve")
+    End If
+    If lock.HasKey("workspace") Then
+        Dim ascent As String = RequiredString(lock.Value("workspace"), "root")
+        If Not String.EndsWith(ascent, "/", True) Then
+            Throw New Exception("Workspace root in lock must be an ancestor path")
+        End If
+        Dim steps As Array Of String = String.Split(ascent, "/")
+        If steps.Count < 2 Then
+            Throw New Exception("Workspace root in lock must be an ancestor path")
+        End If
+        For i As Integer = 0 To steps.Count - 2
+            If String.Compare(steps(i), "..", True) <> 0 Then
+                Throw New Exception("Workspace root in lock must be an ancestor path")
+            End If
+        Next
+        Dim workspaceRoot As String = RootPath(Path.Join(root, ascent))
+        If String.Compare(ProjectFingerprint(workspaceRoot), RequiredString(lock.Value("workspace"), "fingerprint"), True) <> 0 Then
+            Throw New Exception("Workspace lock is stale; resolve at the workspace root")
+        End If
+        Dim workspaceLock As JSONItem = LoadObject(Path.Join(workspaceRoot, "bpm.lock"))
+        Dim belongs As Boolean = False
+        For Each relative As String In WorkspaceMembers(workspaceRoot, Manifest(workspaceRoot)).Keys()
+            If String.Compare(RootPath(Path.Join(workspaceRoot, relative)), RootPath(root), True) = 0 Then
+                belongs = True
+            End If
+        Next
+        If Not belongs Then
+            Throw New Exception("Project is not a member of its recorded workspace")
+        End If
+        For Each name As String In lock.Value("packages").Keys()
+            If String.Compare(Canonical(lock.Value("packages").Value(name)), Canonical(workspaceLock.Value("packages").Value(name)), True) <> 0 Then
+                Throw New Exception("Workspace member selection differs from root lock; resolve at the workspace root")
+            End If
+        Next
+    End If
+    If Not lock.Value("packages").IsObject() Then
+        Throw New Exception("Lock packages must be an object")
+    End If
+    For Each name As String In lock.Value("packages").Keys()
+        Dim entry As JSONItem = lock.Value("packages").Value(name)
+        If Not Identifier(name) Or String.Compare(String.LCase(name), name, True) <> 0 Or RequiredString(entry, "name") <> name Then
+            Throw New Exception("Invalid package identity in lock: " + name)
+        End If
+        ValidateHex(RequiredString(entry, "sha256"), 64, "archive SHA-256")
+        ValidateLockedSource(entry, name)
+    Next
+    Dim active As JSONItem = JSONItem.NewObject()
+    Dim visited As JSONItem = JSONItem.NewObject()
+    For Each name As String In lock.Value("packages").Keys()
+        ValidateLockedGraph(name, lock.Value("packages"), active, visited)
+    Next
+    Dim expectedGraph As JSONItem = DependencyClosure(Manifest(root), lock.Value("packages"))
+    Dim currentMembers As JSONItem = WorkspaceMembers(root, Manifest(root))
+    For Each relative As String In currentMembers.Keys()
+        Dim memberGraph As JSONItem = DependencyClosure(currentMembers.Value(relative), lock.Value("packages"))
+        For Each name As String In memberGraph.Keys()
+            expectedGraph.Value(name) = memberGraph.Value(name)
+        Next
+    Next
+    If expectedGraph.Count() <> lock.Value("packages").Count() Then
+        Throw New Exception("Lock contains packages outside the project/member dependency closure; run bpm resolve")
+    End If
+    If lock.HasKey("install") Then
+        If Not lock.Value("install").IsArray() Then
+            Throw New Exception("Lock install must be an array")
+        End If
+        Dim installed As JSONItem = JSONItem.NewObject()
+        Dim names As JSONItem = lock.Value("install")
+        For i As Integer = 0 To names.Count() - 1
+            Dim name As String = names.ValueAt(i).AsString().Or("")
+            If Not lock.Value("packages").HasKey(name) Or installed.HasKey(name) Then
+                Throw New Exception("Invalid or duplicate install identity in lock")
+            End If
+            installed.Value(name) = True
+        Next
+        Dim expected As JSONItem = DependencyClosure(Manifest(root), lock.Value("packages"))
+        If installed.Count() <> expected.Count() Then
+            Throw New Exception("Lock install set does not match project dependencies")
+        End If
+        For Each name As String In expected.Keys()
+            If Not installed.HasKey(name) Then
+                Throw New Exception("Lock install set omits project dependency: " + name)
+            End If
+        Next
+    End If
+    If lock.HasKey("members") Then
+        If Not lock.Value("members").IsObject() Then
+            Throw New Exception("Lock members must be an object")
+        End If
+        If String.Compare(Canonical(lock.Value("members")), Canonical(WorkspaceMembers(root, Manifest(root))), True) <> 0 Then
+            Throw New Exception("Lock workspace members do not match project configuration")
+        End If
+    ElseIf Manifest(root).HasKey("workspaces") Then
+        Throw New Exception("Workspace lock is missing member metadata")
+    End If
+    Return lock
+End Function
+
+Function ArtifactName(entry As JSONItem) As String
+    Dim name As String = RequiredString(entry, "name")
+    Dim version As String = RequiredString(entry, "version")
+    If Not Identifier(name) Then
+        Throw New Exception("Invalid package name in lock")
+    End If
+    Dim relative As String = name + "-" + version + ".buipkg"
+    RelativePath(relative)
+    Return relative
+End Function
+
+Function ArchivePackageName(filename As String) As String
+    Dim info As String = Command([Packager(), "pkg", "info", filename])
+    For Each line As String In String.Split(info, "\n")
+        If String.StartsWith(line, "name ", True) Then
+            Dim name As String = String.Trim(String.Substring(line, 4))
+            If Identifier(name) Then
+                Return String.LCase(name)
+            End If
+        End If
+    Next
+    Throw New Exception("Cannot inspect package identity: " + filename)
+End Function
+
+Function ArchiveVersion(filename As String) As String
+    Dim info As String = Command([Packager(), "pkg", "info", filename])
+    For Each line As String In String.Split(info, "\n")
+        If String.StartsWith(line, "version ", True) Then
+            Dim version As String = String.Trim(String.Substring(line, 7))
+            ParseVersion(version)
+            Return version
+        End If
+    Next
+    Throw New Exception("Cannot inspect archive version")
+End Function
+
+Function RegistryLocation(location As String, owner As String) As String
+    If String.StartsWith(location, "https://", True) Then
+        For Each character As String In String.Chars(location)
+            If Not String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/._-~%", character, True) Then
+                Throw New Exception("Unsafe registry URL; credentials belong in BPM_REGISTRY_TOKEN")
+            End If
+        Next
+        While String.EndsWith(location, "/", True)
+            location = String.Left(location, String.Len(location) - 1)
+        End While
+        Return location
+    End If
+    If String.Contains(location, "://", True) Then
+        Throw New Exception("Registries require HTTPS or a filesystem directory")
+    End If
+    If Not IsAbsolute(location) Then
+        location = Path.Join(owner, location)
+    End If
+    Return RootPath(location)
+End Function
+
+Function RegistryCoordinate(source As JSONItem, name As String) As String
+    Dim coordinate As String = source.Value("package").AsString().Or(String.LCase(name))
+    RelativePath(coordinate)
+    Dim parts As Array Of String = String.Split(coordinate, "/")
+    If parts.Count > 2 Or (parts.Count = 2 And Not String.StartsWith(parts(0), "@", True)) Then
+        Throw New Exception("Registry coordinate must be name or @scope/name")
+    End If
+    If (parts.Count = 1 And String.StartsWith(parts(0), "@", True)) Or (parts.Count = 2 And (String.Len(parts(0)) <= 1 Or String.StartsWith(parts(1), "@", True))) Then
+        Throw New Exception("Invalid scoped registry coordinate")
+    End If
+    For Each character As String In String.Chars(coordinate)
+        If Not String.Contains("abcdefghijklmnopqrstuvwxyz0123456789_-/@", character, True) Then
+            Throw New Exception("Registry coordinates must be lowercase ASCII")
+        End If
+    Next
+    If coordinate = "@" Or String.EndsWith(coordinate, "/", True) Then
+        Throw New Exception("Invalid registry coordinate")
+    End If
+    Return coordinate
+End Function
+
+Function CurlConfig(work As String) As Array Of String
+    Dim filename As String = Path.Join(work, "curl.conf")
+    Dim token As String = System.EnvironmentVariable("BPM_REGISTRY_TOKEN").Or("")
+    Dim body As String = ""
+    If token <> "" Then
+        For Each character As String In String.Chars(token)
+            If Not String.Contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-~", character, True) Then
+                Throw New Exception("Registry token must use URL-safe token characters")
+            End If
+        Next
+        body = "header = \"Authorization: Bearer " + token + "\"\n"
+    End If
+    WriteText(filename, body)
+    Return ["curl", "--disable", "--config", filename, "--proto", "=https", "--tlsv1.2", "--fail", "--silent", "--show-error", "--connect-timeout", "15", "--max-time", "120"]
+End Function
+
+Sub RegistryRead(location As String, relative As String, destination As String, work As String, limitBytes As Integer)
+    RelativePath(relative)
+    If String.StartsWith(location, "https://", True) Then
+        Command(AppendArguments(CurlConfig(work), ["--max-filesize", Str(limitBytes), "-o", destination, location + "/" + relative]))
+    Else
+        NoPathSymlinks(location, relative)
+        Dim source As New FileSystemItem(Path.Join(location, relative))
+        If source.Length() < 0 Or source.Length() > limitBytes Then
+            Throw New Exception("Missing or oversized registry file: " + relative)
+        End If
+        CopyFile(source.FullPath(), destination)
+    End If
+End Sub
+
+Sub RegistryWrite(location As String, relative As String, filename As String, work As String, resume As Boolean)
+    Try
+        Command(AppendArguments(CurlConfig(work), ["-X", "PUT", "-H", "If-None-Match: *", "--upload-file", filename, location + "/" + relative]))
+    Catch e As Exception
+        If Not resume Then
+            Throw e
+        End If
+        Dim existing As String = Path.Join(work, "existing-upload")
+        RegistryRead(location, relative, existing, work, 1073741824)
+        If String.Compare(SHA256(existing), SHA256(filename), True) <> 0 Then
+            Throw New Exception("Immutable registry upload conflicts with existing bytes: " + relative)
+        End If
+    End Try
+End Sub
+
+Sub ValidatePublicationSource(source As JSONItem, name As String)
+    ValidateSource(source)
+    If source.HasKey("path") Or source.HasKey("archive") Then
+        Throw New Exception("Release dependencies require Git/registry origins, not local paths")
+    End If
+    If source.HasKey("registry") Then
+        Dim location As String = RequiredString(source, "registry")
+        If Not IsAbsolute(location) And Not String.StartsWith(location, "https://", True) Then
+            Throw New Exception("Published registry origins must be absolute directories or HTTPS URLs: " + name)
+        End If
+        RegistryCoordinate(source, name)
+    End If
+End Sub
+
+Function AcquireArchive(name As String, source As JSONItem, owner As String, work As String, cache As String) As JSONItem
+    Dim entry As JSONItem = JSONItem.NewObject()
+    Dim origin As JSONItem = JSONItem.NewObject()
+    Dim artifact As String = Path.Join(work, "package.buipkg")
+    If source.HasKey("archive") Then
+        Dim location As String = RequiredString(source, "archive")
+        If Not IsAbsolute(location) Then
+            location = Path.Join(owner, location)
+        End If
+        NoSymlink(location)
+        CopyFile(location, artifact)
+        origin.Value("kind") = "archive"
+        origin.Value("archive") = location
+        entry.Value("dependencies") = JSONItem.NewObject()
+    Else
+        Dim location As String = RegistryLocation(RequiredString(source, "registry"), owner)
+        Dim coordinate As String = RegistryCoordinate(source, name)
+        Dim version As String = RequiredString(source, "version")
+        Dim prefix As String = coordinate + "/" + version + "/"
+        RegistryRead(location, prefix + "release.json", Path.Join(work, "release.json"), work, 1048576)
+        entry = LoadObject(Path.Join(work, "release.json"))
+        If entry.Value("schema").AsNumber().Or(0.0) <> 1.0 Or RequiredString(entry, "name") <> name Or String.Compare(RequiredString(entry, "version"), version, True) <> 0 Then
+            Throw New Exception("Registry release identity does not match request")
+        End If
+        If Not entry.Value("dependencies").IsObject() Then
+            Throw New Exception("Registry dependencies must be an object")
+        End If
+        RegistryRead(location, prefix + "package.buipkg", artifact, work, 1073741824)
+        If String.Compare(SHA256(artifact), RequiredString(entry, "sha256"), True) <> 0 Then
+            Throw New Exception("Registry artifact SHA-256 mismatch")
+        End If
+        origin.Value("kind") = "registry"
+        origin.Value("registry") = location
+        origin.Value("package") = coordinate
+        origin.Value("version") = version
+    End If
+    If ArchivePackageName(artifact) <> name Then
+        Throw New Exception("Archive exports a different package name: " + name)
+    End If
+    Dim version As String = ArchiveVersion(artifact)
+    If source.HasKey("version") And String.Compare(version, RequiredString(source, "version"), True) <> 0 Then
+        Throw New Exception("Archive version does not match request")
+    End If
+    Dim digest As String = SHA256(artifact)
+    StoreArtifact(artifact, cache, digest)
+    entry.Value("name") = name
+    entry.Value("version") = version
+    entry.Value("sha256") = digest
+    entry.Value("source") = origin
+    entry.Remove("snapshot")
+    Return entry
+End Function
+
+Sub Publish(root As String)
+    Dim settings As JSONItem = Manifest(root)
+    Dim publication As JSONItem = settings.Value("publish")
+    Dim metadata As JSONItem = PackageMetadata(root)
+    Dim location As String = RegistryLocation(RequiredString(publication, "registry"), root)
+    Dim coordinate As String = RegistryCoordinate(publication, RequiredString(metadata, "name"))
+    Dim version As String = RequiredString(metadata, "version")
+    If settings.Value("replace").Count() <> 0 Then
+        Throw New Exception("Publishing with replacements is forbidden")
+    End If
+    For Each name As String In settings.Value("dependencies").Keys()
+        Dim source As JSONItem = settings.Value("dependencies").Value(name)
+        ValidatePublicationSource(source, name)
+    Next
+    ' Publish only from a clean committed package, recording source provenance.
+    Dim selectedArgs As Array Of String = []
+    For Each relative As String In PackageFiles(root, settings)
+        Array.Append(selectedArgs, relative)
+    Next
+    GitCommand(AppendArguments(["-C", root, "ls-files", "--error-unmatch", "--"], selectedArgs))
+    If GitCommand(AppendArguments(["-C", root, "status", "--porcelain", "--untracked-files=all", "--"], selectedArgs)) <> "" Then
+        Throw New Exception("Publishing requires clean committed package inputs")
+    End If
+    Dim commit As String = GitCommand(["-C", root, "rev-parse", "--verify", "HEAD^{commit}"])
+    Dim work As String = Temporary()
+    Try
+        Dim stage As String = Path.Join(work, "release")
+        MakeDirectory(stage)
+        Dim basename As String = RequiredString(metadata, "name") + "-" + version
+        Dim bundle As New FileSystemItem(Path.Join(root, basename + ".bpm.tar"))
+        If Not bundle.IsFile() Or bundle.Length() > 1073741824 Then
+            Throw New Exception("Run bpm pack --dry-run and bpm pack before publishing; the reviewed bundle is required")
+        End If
+        NoPathSymlinks(root, ".bpm/packed/" + basename + ".json")
+        Dim receipt As JSONItem = LoadObject(Path.Join(root, ".bpm/packed/" + basename + ".json"))
+        If String.Compare(RequiredString(receipt, "sha256"), SHA256(bundle.FullPath()), True) <> 0 Then
+            Throw New Exception("Packed release was modified after packing; refusing publication")
+        End If
+        Dim listing As Array Of String = String.Split(Command(["tar", "-tf", bundle.FullPath()]), "\n")
+        If listing.Count > 20000 Then
+            Throw New Exception("Release bundle has too many entries")
+        End If
+        Dim seen As JSONItem = JSONItem.NewObject()
+        For Each relative As String In listing
+            RelativePath(relative)
+            If seen.HasKey(String.LCase(relative)) Then
+                Throw New Exception("Duplicate/case-colliding release member")
+            End If
+            seen.Value(String.LCase(relative)) = True
+        Next
+        For Each line As String In String.Split(Command(["tar", "-tvf", bundle.FullPath()]), "\n")
+            If Not String.StartsWith(line, "-", True) Then
+                Throw New Exception("Release bundle may contain only regular files")
+            End If
+        Next
+        Command(["tar", "-xf", bundle.FullPath(), "-C", stage])
+        Dim entry As JSONItem = LoadObject(Path.Join(stage, "bpm-release.json"))
+        If RequiredString(entry, "name") <> RequiredString(metadata, "name") Or String.Compare(RequiredString(entry, "version"), version, True) <> 0 Then
+            Throw New Exception("Release bundle identity mismatch")
+        End If
+        If String.Compare(Canonical(settings), Canonical(LoadObject(Path.Join(stage, "bpm.json"))), True) <> 0 Then
+            Throw New Exception("Package settings changed after packing")
+        End If
+        Dim expected As Array Of String = ReleasePaths(root, settings, metadata)
+        If expected.Count <> listing.Count Then
+            Throw New Exception("Release bundle members differ from pack plan")
+        End If
+        For Each relative As String In expected
+            If Not seen.HasKey(String.LCase(relative)) Then
+                Throw New Exception("Release bundle omits expected member: " + relative)
+            End If
+            NoPathSymlinks(stage, relative)
+        Next
+        If String.Compare(SHA256(Path.Join(stage, basename + ".buipkg")), RequiredString(entry, "sha256"), True) <> 0 Then
+            Throw New Exception("Packed artifact checksum mismatch")
+        End If
+        For Each relative As String In entry.Value("inputs").Keys()
+            Dim inputPath As String = Path.Join(root, relative)
+            If relative = "manifest.json" Then
+                Dim normalized As JSONItem = PackageMetadata(root)
+                normalized.Remove("files")
+                normalized.Remove("digest")
+                inputPath = Path.Join(work, "manifest.json")
+                SaveObject(inputPath, normalized)
+            End If
+            If String.Compare(SHA256(inputPath), entry.Value("inputs").Value(relative).AsString().Or(""), True) <> 0 Then
+                Throw New Exception("Package input changed after packing: " + relative)
+            End If
+        Next
+        CopyFile(Path.Join(stage, basename + ".buipkg"), Path.Join(stage, "package.buipkg"))
+        CopyFile(bundle.FullPath(), Path.Join(stage, "release.bpm.tar"))
+        entry.Value("bundleSHA256") = SHA256(bundle.FullPath())
+        If Not entry.Value("dependencies").IsObject() Then
+            entry.Value("dependencies") = JSONItem.NewObject()
+        End If
+        entry.Value("commit") = commit
+        Dim packedSealer As String = RequiredString(entry, "sealer")
+        Dim provenance As JSONItem = JSONItem.NewObject()
+        provenance.Value("commit") = commit
+        provenance.Value("package") = coordinate
+        entry.Value("provenance") = provenance
+        SaveObject(Path.Join(stage, "release.json"), entry)
+        CopyFile(Path.Join(root, "bpm.json"), Path.Join(stage, "bpm.json"))
+        For Each relative As String In ReleasePaths(root, settings, metadata)
+            If relative <> "bpm-release.json" And Not String.EndsWith(relative, ".buipkg", True) And relative <> "bpm.json" Then
+                CopyFile(Path.Join(root, relative), Path.Join(stage, relative))
+            End If
+        Next
+        Dim prefix As String = coordinate + "/" + version
+        If String.StartsWith(location, "https://", True) Then
+            ' The registry must enforce conditional creation; metadata commits last.
+            For Each relative As String In ["package.buipkg", "bpm.json", "release.bpm.tar", "release.json"]
+                RegistryWrite(location, prefix + "/" + relative, Path.Join(stage, relative), work, relative <> "release.json")
+            Next
+        Else
+            Dim destination As New FileSystemItem(Path.Join(location, prefix))
+            NoPathSymlinks(location, prefix)
+            If destination.Exists() Then
+                Throw New Exception("Registry version already exists; releases are immutable")
+            End If
+            MakeDirectory(destination.ParentPath())
+            Dim transfer As String = TemporaryIn(destination.ParentPath(), ".bpm-publish-")
+            Try
+                CopyTree(stage, transfer)
+                ' mkdir of a separate claim prevents concurrent publication races.
+                Dim claim As String = destination.FullPath() + ".publishing"
+                ExclusiveDirectory(claim)
+                Try
+                    WriteText(Path.Join(claim, "project"), RootPath(root))
+                    WriteText(Path.Join(claim, "owner"), Str(BPMProcessID()))
+                    If destination.Exists() Then
+                        Throw New Exception("Registry version already exists")
+                    End If
+                    Dim prepared As New FileSystemItem(transfer)
+                    If Not prepared.MoveTo(destination) Then
+                        Throw New Exception("Cannot commit registry release")
+                    End If
+                Finally
+                    DiscardGuard(claim)
+                End Try
+            Finally
+                Dim remaining As New FileSystemItem(transfer)
+                If remaining.Exists() Then
+                    RemoveTemporary(transfer)
+                End If
+            End Try
+        End If
+        Print "Published " + coordinate + "@" + version + " sha256:" + RequiredString(entry, "sha256")
+    Finally
+        RemoveTemporary(work)
+    End Try
+End Sub
+
+Function CompilerPayload(relative As String) As Boolean
+    If relative = "manifest.json" Then
+        Return True
+    End If
+    For Each directory As String In ["modules/", "declares/"]
+        If String.StartsWith(relative, directory, True) And String.EndsWith(relative, ".bui", True) Then
+            Return True
+        End If
+    Next
+    For Each directory As String In ["resources/", "link/", "runtime/"]
+        If String.StartsWith(relative, directory, True) Then
+            Return True
+        End If
+    Next
+    Return False
+End Function
+
+Sub ValidatePackagePlan(metadata As JSONItem, files As Array Of String)
+    Dim selected As JSONItem = JSONItem.NewObject()
+    Dim payloadCount As Integer = 0
+    For Each relative As String In files
+        selected.Value(relative) = True
+        If relative <> "manifest.json" And CompilerPayload(relative) Then
+            payloadCount += 1
+        End If
+    Next
+    For Each field As String In ["modules", "declares", "resources"]
+        Dim declared As JSONItem = metadata.Value(field)
+        If metadata.HasKey(field) And Not declared.IsArray() Then
+            Throw New Exception("Expected manifest array: " + field)
+        End If
+        For i As Integer = 0 To declared.Count() - 1
+            Dim relative As String = declared.ValueAt(i).AsString().Or("")
+            RelativePath(relative)
+            If Not selected.HasKey(relative) Then
+                Throw New Exception("Allowlist omits declared payload: " + relative)
+            End If
+        Next
+    Next
+    ' Explicit compiler resource lists replace auto-discovery. Never report a
+    ' selected documentation file in the lock while silently omitting its bytes.
+    If metadata.HasKey("resources") Then
+        Dim declaredDocs As JSONItem = JSONItem.NewObject()
+        Dim resourcePaths As JSONItem = metadata.Value("resources")
+        For i As Integer = 0 To resourcePaths.Count() - 1
+            declaredDocs.Value(resourcePaths.ValueAt(i).AsString().Or("")) = True
+        Next
+        For Each relative As String In files
+            If String.StartsWith(relative, "resources/buoy-docs/", True) And Not declaredDocs.HasKey(relative) Then
+                Throw New Exception("Explicit manifest resources omits documentation: " + relative + ". List every documentation asset or omit resources to enable discovery.")
+            End If
+        Next
+    End If
+    If payloadCount = 0 Then
+        Throw New Exception("Package contains no compiler payload files")
+    End If
+End Sub
+
+Function ReleasePaths(root As String, settings As JSONItem, metadata As JSONItem) As Array Of String
+    Dim paths As Array Of String = []
+    Array.Append(paths, "bpm.json")
+    Array.Append(paths, "bpm-release.json")
+    Array.Append(paths, RequiredString(metadata, "name") + "-" + RequiredString(metadata, "version") + ".buipkg")
+    For Each relative As String In PackageFiles(root, settings)
+        ' Compiler archives contain only its recognized payload directories.
+        ' Keep selected documentation separately in the release envelope.
+        If relative <> "bpm.json" And Not CompilerPayload(relative) Then
+            Array.Append(paths, relative)
+        End If
+    Next
+    Array.Sort(paths)
+    Return paths
+End Function
+
+Sub PackRelease(root As String, settings As JSONItem, metadata As JSONItem)
+    Dim basename As String = RequiredString(metadata, "name") + "-" + RequiredString(metadata, "version")
+    Dim destination As New FileSystemItem(Path.Join(root, basename + ".bpm.tar"))
+    If destination.Exists() Then
+        Throw New Exception("Output already exists: " + destination.Name())
+    End If
+    NoPathSymlinks(root, ".bpm/packed/" + basename + ".json")
+    Dim receiptDirectory As New FileSystemItem(Path.Join(root, ".bpm/packed"))
+    If receiptDirectory.Exists() And Not receiptDirectory.IsFolder() Then
+        Throw New Exception("Package receipt path is not a directory")
+    End If
+    Dim work As String = Temporary()
+    Try
+        Dim stage As String = Path.Join(work, "release")
+        MakeDirectory(stage)
+        Dim entry As JSONItem = Seal(root, Path.Join(stage, basename + ".buipkg"), settings)
+        entry.Value("schema") = 1.0
+        entry.Value("dependencies") = settings.Value("dependencies")
+        entry.Value("sealer") = Command([Packager(), "--version"])
+        SaveObject(Path.Join(stage, "bpm-release.json"), entry)
+        Dim commandArgs As Array Of String = []
+        For Each argument As String In ["tar", "-cf", Path.Join(work, "release.tar"), "-C", stage, "--"]
+            Array.Append(commandArgs, argument)
+        Next
+        For Each relative As String In ReleasePaths(root, settings, metadata)
+            If relative <> "bpm-release.json" And relative <> basename + ".buipkg" Then
+                CopyFile(Path.Join(root, relative), Path.Join(stage, relative))
+            End If
+            Array.Append(commandArgs, relative)
+        Next
+        Dim archiveEnvironment As JSONItem = JSONItem.NewObject()
+        archiveEnvironment.Value("COPYFILE_DISABLE") = "1"
+        RunCommand(commandArgs, archiveEnvironment)
+        AtomicCopy(Path.Join(work, "release.tar"), destination.FullPath())
+        Dim receipt As JSONItem = JSONItem.NewObject()
+        receipt.Value("sha256") = SHA256(destination.FullPath())
+        MakeDirectory(Path.Join(root, ".bpm/packed"))
+        SaveObject(Path.Join(work, "receipt.json"), receipt)
+        AtomicCopy(Path.Join(work, "receipt.json"), Path.Join(root, ".bpm/packed/" + basename + ".json"))
+        Print destination.Name() + " sha256:" + RequiredString(receipt, "sha256")
+    Finally
+        RemoveTemporary(work)
+    End Try
+End Sub
+
+Sub VerifyAll(root As String)
+    Verify(root)
+    For Each relative As String In Locked(root).Value("members").Keys()
+        Verify(Path.Join(root, relative))
+    Next
+End Sub
+
+Sub Verify(root As String)
+    Dim lock As JSONItem = Locked(root)
+    Dim graph As JSONItem = InstallGraph(lock)
+    For Each name As String In graph.Keys()
+        Dim entry As JSONItem = graph.Value(name)
+        Dim filename As String = Path.Join(PackageDirectory(root, False), ArtifactName(entry))
+        If String.Compare(SHA256(filename), RequiredString(entry, "sha256"), True) <> 0 Then
+            Throw New Exception("Package hash mismatch: " + name)
+        End If
+    Next
+    Dim folder As New FileSystemItem(PackageDirectory(root, False))
+    For Each archive As FileSystemItem In folder.Children()
+        If String.EndsWith(archive.Name(), ".buipkg", False) Then
+            NoSymlink(archive.FullPath())
+            Dim name As String = ArchivePackageName(archive.FullPath())
+            If graph.HasKey(name) Then
+                If String.Compare(archive.Name(), ArtifactName(graph.Value(name)), True) <> 0 Then
+                    Throw New Exception("Duplicate archive for locked package: " + archive.FullPath())
+                End If
+            End If
+        End If
+    Next
+    Print "Verified " + Str(graph.Count()) + " locked archive(s). Global packages are not isolated by this compiler."
+End Sub
+
+Sub PrepareInstall(root As String, destination As String, guard As String, owned As JSONItem, planned As JSONItem)
+    Dim before As JSONItem = JSONItem.NewObject()
+    Dim allNames As JSONItem = Json.Parse(Canonical(owned))
+    For Each filename As String In planned.Keys()
+        allNames.Value(filename) = planned.Value(filename)
+    Next
+    For Each filename As String In allNames.Keys()
+        RelativePath(filename)
+        If String.Contains(filename, "/", True) Or Not String.EndsWith(filename, ".buipkg", True) Then
+            Throw New Exception("Unsafe install ownership entry")
+        End If
+        NoSymlink(Path.Join(destination, filename))
+        Dim existing As New FileSystemItem(Path.Join(destination, filename))
+        If existing.IsFile() Then
+            before.Value(filename) = SHA256(existing.FullPath())
+            CopyFile(existing.FullPath(), Path.Join(guard, "backup/" + filename))
+        ElseIf existing.Exists() Then
+            Throw New Exception("Package destination is not a regular file: " + filename)
+        Else
+            before.Value(filename) = ""
+        End If
+    Next
+    Dim journal As JSONItem = JSONItem.NewObject()
+    journal.Value("root") = RootPath(root)
+    journal.Value("before") = before
+    journal.Value("after") = planned
+    journal.Value("owned") = owned
+    SaveObject(Path.Join(guard, "journal.json"), journal)
+    WriteText(Path.Join(guard, "prepared"), "yes")
+End Sub
+
+Sub RollbackInstall(root As String, destination As String, guard As String)
+    Dim journal As JSONItem = LoadObject(Path.Join(guard, "journal.json"))
+    If String.Compare(RequiredString(journal, "root"), RootPath(root), True) <> 0 Then
+        Throw New Exception("Install recovery must run from its owning project: " + RequiredString(journal, "root"))
+    End If
+    Dim before As JSONItem = journal.Value("before")
+    Dim planned As JSONItem = journal.Value("after")
+    For Each filename As String In before.Keys()
+        RelativePath(filename)
+        If String.Contains(filename, "/", True) Or Not String.EndsWith(filename, ".buipkg", True) Then
+            Throw New Exception("Unsafe recovery ownership entry")
+        End If
+        Dim target As New FileSystemItem(Path.Join(destination, filename))
+        NoSymlink(target.FullPath())
+        Dim oldHash As String = before.Value(filename).AsString().Or("")
+        If target.Exists() Then
+            Dim currentHash As String = SHA256(target.FullPath())
+            If String.Compare(currentHash, oldHash, True) <> 0 And String.Compare(currentHash, planned.Value(filename).AsString().Or(""), True) <> 0 Then
+                Throw New Exception("Recovery refuses a file changed by another writer: " + filename)
+            End If
+        End If
+        If oldHash <> "" Then
+            Dim backup As String = Path.Join(guard, "backup/" + filename)
+            If String.Compare(SHA256(backup), oldHash, True) <> 0 Then
+                Throw New Exception("Install recovery backup hash mismatch")
+            End If
+            AtomicCopy(backup, target.FullPath())
+        ElseIf target.Exists() Then
+            If Not target.Delete() Then
+                Throw New Exception("Cannot remove uncommitted install file")
+            End If
+        End If
+    Next
+    SaveObject(Path.Join(guard, "old-index.json"), journal.Value("owned"))
+    AtomicCopy(Path.Join(guard, "old-index.json"), Path.Join(root, ".bpm/installed.json"))
+End Sub
+
+Sub InactiveGuard(guard As String)
+    NoSymlink(guard)
+    Dim owner As New FileSystemItem(Path.Join(guard, "owner"))
+    If Not owner.IsFile() Then
+        Throw New Exception("Guard has no recorded owner; inspect it manually before removing: " + guard)
+    End If
+    Dim pidText As String = String.Trim(ReadText(owner.FullPath()))
+    If Not DecimalDigits(pidText) Or Integer.Parse(pidText).Or(0) <= 0 Then
+        Throw New Exception("Invalid process identifier in guard")
+    End If
+    Dim state As Integer = HostAlive(Integer.Parse(pidText).Value)
+    If state < 0 Then Throw New Exception("Cannot determine owning process status")
+    If state = 1 Then Throw New Exception("Refusing recovery while the owning process is alive: " + pidText)
+End Sub
+
+Sub RepairProject(root As String, scope As JSONItem)
+    CollectGarbage(Path.Join(root, ".bpm"))
+    CollectGarbage(PackageDirectory(root, False))
+    NoSymlink(Path.Join(root, ".bpm"))
+    Dim destination As New FileSystemItem(PackageDirectory(root, False))
+    If destination.IsFolder() Then
+        Dim guard As New FileSystemItem(Path.Join(RootPath(destination.FullPath()), ".bpm-install-guard"))
+        If guard.Exists() Then
+            InactiveGuard(guard.FullPath())
+            Dim prepared As New FileSystemItem(Path.Join(guard.FullPath(), "prepared"))
+            Dim committed As New FileSystemItem(Path.Join(guard.FullPath(), "committed"))
+            Dim owned As Boolean = True
+            If prepared.IsFile() And Not committed.IsFile() Then
+                Dim journal As JSONItem = LoadObject(Path.Join(guard.FullPath(), "journal.json"))
+                Dim project As String = RootPath(RequiredString(journal, "root"))
+                If String.Compare(project, RootPath(root), True) = 0 Then
+                    RollbackInstall(root, destination.FullPath(), guard.FullPath())
+                ElseIf scope.HasKey(project) Then
+                    ' A shared destination belongs to another member. Leave its
+                    ' journal until that owning project is visited below.
+                    owned = False
+                Else
+                    Throw New Exception("Install recovery belongs to a project outside this workspace: " + project)
+                End If
+            End If
+            If owned Then
+                DiscardGuard(guard.FullPath())
+            End If
+        End If
+    End If
+    Dim rootGuard As New FileSystemItem(Path.Join(root, ".bpm/write-lock"))
+    If rootGuard.Exists() Then
+        InactiveGuard(rootGuard.FullPath())
+        RestoreMetadata(root, "metadata")
+        RestoreMetadata(root, "edit")
+        DiscardGuard(rootGuard.FullPath())
+    End If
+    Dim settings As JSONItem = Manifest(root)
+    If settings.Value("publish").IsObject() Then
+        Dim publication As JSONItem = settings.Value("publish")
+        Dim location As String = RegistryLocation(RequiredString(publication, "registry"), root)
+        If Not String.StartsWith(location, "https://", True) Then
+            Dim metadata As JSONItem = PackageMetadata(root)
+            Dim coordinate As String = RegistryCoordinate(publication, RequiredString(metadata, "name"))
+            NoPathSymlinks(location, coordinate)
+            CollectGarbage(Path.Join(location, coordinate))
+            Dim relative As String = coordinate + "/" + RequiredString(metadata, "version") + ".publishing"
+            NoPathSymlinks(location, relative)
+            Dim claim As New FileSystemItem(Path.Join(location, relative))
+            If claim.Exists() Then
+                Dim projectFile As New FileSystemItem(Path.Join(claim.FullPath(), "project"))
+                If Not projectFile.IsFile() Then
+                    Throw New Exception("Publish claim has no ownership metadata; inspect it manually before removal")
+                End If
+                If String.Compare(ReadText(Path.Join(claim.FullPath(), "project")), RootPath(root), True) <> 0 Then
+                    Throw New Exception("Publish claim belongs to another project; inspect it manually")
+                End If
+                InactiveGuard(claim.FullPath())
+                DiscardGuard(claim.FullPath())
+            End If
+        End If
+    End If
+End Sub
+
+Sub Repair(root As String)
+    Dim projects As JSONItem = JSONItem.NewObject()
+    projects.Value(RootPath(root)) = True
+    For Each relative As String In WorkspaceMembers(root, Manifest(root)).Keys()
+        projects.Value(RootPath(Path.Join(root, relative))) = True
+    Next
+    ' Check every writer before removing any workspace guards. A live member
+    ' must not be mistaken for stale state left by an interrupted root command.
+    For Each project As String In projects.Keys()
+        NoSymlink(Path.Join(project, ".bpm"))
+        Dim rootGuard As New FileSystemItem(Path.Join(project, ".bpm/write-lock"))
+        If rootGuard.Exists() Then
+            InactiveGuard(rootGuard.FullPath())
+            Dim workspaceOwner As New FileSystemItem(Path.Join(rootGuard.FullPath(), "workspace"))
+            NoSymlink(workspaceOwner.FullPath())
+            If workspaceOwner.IsFile() Then
+                If String.Compare(ReadText(workspaceOwner.FullPath()), RootPath(root), True) <> 0 Then
+                    Throw New Exception("Workspace recovery must run from its workspace root")
+                End If
+            End If
+        End If
+        Dim guard As New FileSystemItem(Path.Join(PackageDirectory(project, False), ".bpm-install-guard"))
+        If guard.Exists() Then
+            InactiveGuard(guard.FullPath())
+            Dim prepared As New FileSystemItem(Path.Join(guard.FullPath(), "prepared"))
+            Dim committed As New FileSystemItem(Path.Join(guard.FullPath(), "committed"))
+            If prepared.IsFile() And Not committed.IsFile() Then
+                Dim owner As String = RootPath(RequiredString(LoadObject(Path.Join(guard.FullPath(), "journal.json")), "root"))
+                If Not projects.HasKey(owner) Then
+                    Throw New Exception("Install recovery belongs to a project outside this workspace: " + owner)
+                End If
+            End If
+        End If
+    Next
+    For Each project As String In projects.Keys()
+        RepairProject(project, projects)
+    Next
+    Print "Project/workspace recovery complete; run bpm sync to finish the locked installation"
+End Sub
+
+Function SharedInstallFiles(root As String, destination As String, lock As JSONItem) As JSONItem
+    Dim workspaceRoot As String = root
+    If lock.HasKey("workspace") Then
+        workspaceRoot = RootPath(Path.Join(root, RequiredString(lock.Value("workspace"), "root")))
+    End If
+    Dim projects As Array Of String = []
+    Array.Append(projects, workspaceRoot)
+    For Each relative As String In WorkspaceMembers(workspaceRoot, Manifest(workspaceRoot)).Keys()
+        Array.Append(projects, Path.Join(workspaceRoot, relative))
+    Next
+    Dim retained As JSONItem = JSONItem.NewObject()
+    For Each project As String In projects
+        If String.Compare(RootPath(project), RootPath(root), True) = 0 Then Continue For
+        Dim folder As New FileSystemItem(PackageDirectory(project, False))
+        If Not folder.IsFolder() Then Continue For
+        If String.Compare(RootPath(folder.FullPath()), RootPath(destination), True) <> 0 Then Continue For
+        Dim graph As JSONItem = InstallGraph(Locked(project))
+        For Each name As String In graph.Keys()
+            retained.Value(ArtifactName(graph.Value(name))) = RequiredString(graph.Value(name), "sha256")
+        Next
+    Next
+    Return retained
+End Function
+
+Sub Sync(root As String)
+    Dim lock As JSONItem = Locked(root)
+    Dim graph As JSONItem = InstallGraph(lock)
+    Dim packageDir As String = PackageDirectory(root, True)
+    ' Ownership is per project, but an opted-in destination can be shared.
+    ' A stale ownership record must not remove another project's current input.
+    Dim sharedFiles As JSONItem = SharedInstallFiles(root, packageDir, lock)
+    NoPathSymlinks(root, ".bpm/installed.json")
+    Dim installGuard As String = Path.Join(RootPath(packageDir), ".bpm-install-guard")
+    ExclusiveDirectory(installGuard)
+    Dim cleanGuard As Boolean = True
+    Try
+    WriteText(Path.Join(installGuard, "owner"), Str(BPMProcessID()))
+    Dim owned As JSONItem = JSONItem.NewObject()
+    Dim indexFile As New FileSystemItem(Path.Join(root, ".bpm/installed.json"))
+    If indexFile.IsFile() Then
+        owned = LoadObject(indexFile.FullPath())
+    End If
+    ' Inspect foreign archives by manifest identity, never by filename.
+    Dim folder As New FileSystemItem(packageDir)
+    For Each archive As FileSystemItem In folder.Children()
+        If String.EndsWith(archive.Name(), ".buipkg", False) Then
+            NoSymlink(archive.FullPath())
+            Dim name As String = ArchivePackageName(archive.FullPath())
+            Dim expected As JSONItem = graph.Value(name)
+            Dim digest As String = SHA256(archive.FullPath())
+            If graph.HasKey(name) Then
+                Dim matches As Boolean = String.Compare(digest, RequiredString(expected, "sha256"), True) = 0
+                Dim canonicalFile As Boolean = String.Compare(archive.Name(), ArtifactName(expected), True) = 0
+                If Not owned.HasKey(archive.Name()) And (Not matches Or Not canonicalFile) Then
+                    Throw New Exception("Foreign archive conflicts with locked package: " + archive.FullPath())
+                End If
+            End If
+            If owned.HasKey(archive.Name()) And String.Compare(owned.Value(archive.Name()).AsString().Or(""), digest, True) <> 0 Then
+                Throw New Exception("Previously managed archive was modified: " + archive.FullPath())
+            End If
+        End If
+    Next
+    ' Validate all new inputs before changing the install directory.
+    Dim inputs As New JSONItem
+    For Each name As String In graph.Keys()
+        Dim entry As JSONItem = graph.Value(name)
+        Dim digest As String = RequiredString(entry, "sha256")
+        RelativePath(digest)
+        Dim source As String = Path.Join(root, ".bpm/artifacts/" + digest + ".buipkg")
+        Dim cached As New FileSystemItem(source)
+        If Not cached.IsFile() Then
+            source = Path.Join(packageDir, ArtifactName(entry))
+        End If
+        If String.Compare(SHA256(source), digest, True) <> 0 Then
+            Throw New Exception("Missing or corrupt locked artifact: " + name + "; restore packages/ from version control or run bpm resolve")
+        End If
+        Dim destination As New FileSystemItem(Path.Join(packageDir, ArtifactName(entry)))
+        If destination.Exists() And Not owned.HasKey(destination.Name()) Then
+            If String.Compare(SHA256(destination.FullPath()), digest, True) <> 0 Then
+                Throw New Exception("Refusing to overwrite foreign file: " + destination.FullPath())
+            End If
+        End If
+        inputs.Value(name) = source
+    Next
+    Dim nextIndex As JSONItem = JSONItem.NewObject()
+    For Each name As String In graph.Keys()
+        Dim entry As JSONItem = graph.Value(name)
+        nextIndex.Value(ArtifactName(entry)) = RequiredString(entry, "sha256")
+    Next
+    PrepareInstall(root, packageDir, installGuard, owned, nextIndex)
+    cleanGuard = False
+    Try
+        For Each name As String In graph.Keys()
+            Dim entry As JSONItem = graph.Value(name)
+            AtomicCopy(inputs.Value(name).AsString().Value, Path.Join(packageDir, ArtifactName(entry)))
+        Next
+        For Each filename As String In owned.Keys()
+            RelativePath(filename)
+            If Not nextIndex.HasKey(filename) And Not sharedFiles.HasKey(filename) Then
+                Dim stale As New FileSystemItem(Path.Join(packageDir, filename))
+                If stale.Exists() And Not stale.Delete() Then
+                    Throw New Exception("Cannot remove stale managed archive: " + filename)
+                End If
+            End If
+        Next
+        SaveObject(Path.Join(installGuard, "next-index.json"), nextIndex)
+        AtomicCopy(Path.Join(installGuard, "next-index.json"), indexFile.FullPath())
+        Verify(root)
+        WriteText(Path.Join(installGuard, "committed"), "yes")
+        cleanGuard = True
+    Catch e As Exception
+        RollbackInstall(root, packageDir, installGuard)
+        cleanGuard = True
+        Throw e
+    End Try
+    Finally
+        If cleanGuard Then
+            DiscardGuard(installGuard)
+        End If
+    End Try
+End Sub
+
+Sub Recover(root As String, offline As Boolean)
+    Dim lock As JSONItem = Locked(root)
+    Dim packageDir As String = PackageDirectory(root, False)
+    Dim policyRoot As String = root
+    If lock.HasKey("workspace") Then
+        policyRoot = RootPath(Path.Join(root, RequiredString(lock.Value("workspace"), "root")))
+    End If
+    Dim policy As JSONItem = JSONItem.NewObject()
+    policy.Value("_hosts") = Manifest(policyRoot).Value("allowHosts")
+    Dim cache As String = Path.Join(root, ".bpm/artifacts")
+    NoPathSymlinks(root, ".bpm/artifacts")
+    MakeDirectory(cache)
+    For Each name As String In lock.Value("packages").Keys()
+        Dim entry As JSONItem = lock.Value("packages").Value(name)
+        Dim digest As String = RequiredString(entry, "sha256")
+        Dim artifact As String = Path.Join(cache, digest + ".buipkg")
+        Dim cached As New FileSystemItem(artifact)
+        If cached.IsFile() Then
+            If String.Compare(SHA256(artifact), digest, True) <> 0 Then
+                Throw New Exception("Corrupt cached artifact: " + name)
+            End If
+            Continue For
+        End If
+        Dim installed As New FileSystemItem(Path.Join(packageDir, ArtifactName(entry)))
+        If installed.IsFile() Then
+            If String.Compare(SHA256(installed.FullPath()), digest, True) <> 0 Then
+                Throw New Exception("Installed package hash mismatch: " + name)
+            End If
+            StoreArtifact(installed.FullPath(), cache, digest)
+            Continue For
+        End If
+        If lock.HasKey("workspace") Then
+            Dim workspaceRoot As String = RootPath(Path.Join(root, RequiredString(lock.Value("workspace"), "root")))
+            Dim sharedArtifact As New FileSystemItem(Path.Join(workspaceRoot, ".bpm/artifacts/" + digest + ".buipkg"))
+            If sharedArtifact.IsFile() Then
+                If String.Compare(SHA256(sharedArtifact.FullPath()), digest, True) <> 0 Then
+                    Throw New Exception("Workspace cached artifact was modified: " + name)
+                End If
+                StoreArtifact(sharedArtifact.FullPath(), cache, digest)
+                Continue For
+            End If
+        End If
+        Dim work As String = Temporary()
+        Try
+            Dim origin As JSONItem = entry.Value("source")
+            Dim kind As String = origin.Value("kind").AsString().Or("")
+            If kind = "registry" Or kind = "archive" Then
+                Dim source As JSONItem = JSONItem.NewObject()
+                If kind = "registry" Then
+                    source.Value("registry") = RequiredString(origin, "registry")
+                    source.Value("version") = RequiredString(entry, "version")
+                    source.Value("package") = RequiredString(origin, "package")
+                    If offline And String.StartsWith(RequiredString(origin, "registry"), "https://", True) Then
+                        Throw New Exception("Registry artifact is not cached for offline installation: " + name)
+                    End If
+                Else
+                    source.Value("archive") = RequiredString(origin, "archive")
+                End If
+                CheckSourcePolicy(source, policy)
+                Dim recovered As JSONItem = AcquireArchive(name, source, root, work, work)
+                If String.Compare(RequiredString(recovered, "sha256"), digest, True) <> 0 Then
+                    Throw New Exception("Locked registry/archive digest changed: " + name)
+                End If
+                StoreArtifact(Path.Join(work, digest + ".buipkg"), cache, digest)
+                Continue For
+            End If
+            Dim sourceRoot As String = ""
+            Dim snapshotPath As String = entry.Value("snapshot").AsString().Or("")
+            If snapshotPath <> "" Then
+                RelativePath(snapshotPath)
+                NoPathSymlinks(Path.Join(root, ".bpm"), snapshotPath)
+                Dim snapshotFolder As New FileSystemItem(Path.Join(root, ".bpm/" + snapshotPath))
+                If snapshotFolder.IsFolder() Then
+                    sourceRoot = snapshotFolder.FullPath()
+                End If
+            End If
+            If sourceRoot = "" And Not offline And origin.Value("kind").AsString().Or("") = "git" Then
+                Dim source As JSONItem = JSONItem.NewObject()
+                source.Value("git") = RequiredString(origin, "git")
+                source.Value("rev") = RequiredString(origin, "commit")
+                Dim subdir As String = origin.Value("subdir").AsString().Or("")
+                If subdir <> "" Then
+                    source.Value("subdir") = subdir
+                End If
+                CheckSourcePolicy(source, policy)
+                sourceRoot = RequiredString(FetchSource(source, root, work), "path")
+            End If
+            If sourceRoot = "" Then
+                Throw New Exception("Locked artifact unavailable for " + name + "; restore vendored packages or use bpm fetch with a recoverable Git origin")
+            End If
+            Dim inputs As JSONItem = entry.Value("sourceFiles")
+            For Each relative As String In inputs.Keys()
+                NoPathSymlinks(sourceRoot, relative)
+                If String.Compare(SHA256(Path.Join(sourceRoot, relative)), inputs.Value(relative).AsString().Or(""), True) <> 0 Then
+                    Throw New Exception("Locked source hash mismatch: " + name + "/" + relative)
+                End If
+            Next
+            If String.Compare(Command([Packager(), "--version"]), RequiredString(lock, "sealer"), True) <> 0 Then
+                Throw New Exception("Restoring source requires the locked sealer version; restore the exact archive instead")
+            End If
+            Dim settings As JSONItem = JSONItem.NewObject()
+            Dim config As New FileSystemItem(Path.Join(sourceRoot, "bpm.json"))
+            If config.IsFile() Then
+                settings = Manifest(sourceRoot)
+            End If
+            Dim restored As JSONItem = Seal(sourceRoot, Path.Join(work, "restored.buipkg"), settings)
+            If String.Compare(RequiredString(restored, "sha256"), digest, True) <> 0 Then
+                Throw New Exception("Restored artifact differs from lock: " + name)
+            End If
+            StoreArtifact(Path.Join(work, "restored.buipkg"), cache, digest)
+        Finally
+            RemoveTemporary(work)
+        End Try
+    Next
+End Sub
+
+Sub SyncAll(root As String, offline As Boolean)
+    Dim members As JSONItem = WorkspaceMembers(root, Manifest(root))
+    Dim writers As Array Of String = ClaimWorkspaceWriters(root, members)
+    Try
+        Recover(root, offline)
+        Sync(root)
+        For Each relative As String In Locked(root).Value("members").Keys()
+            Dim memberRoot As String = Path.Join(root, relative)
+            Recover(memberRoot, offline)
+            Sync(memberRoot)
+        Next
+    Finally
+        ReleaseWriters(writers)
+    End Try
+End Sub
+
+Sub EditDependency(root As String, action As String, args As Array Of String)
+    If args.Count < 3 Or Not Identifier(args(2)) Then
+        Throw New Exception("A Buoy dependency name is required")
+    End If
+    Dim name As String = String.LCase(args(2))
+    Dim filename As String = Path.Join(root, "bpm.json")
+    Dim original As String = ReadText(filename)
+    Dim settings As JSONItem = Manifest(root)
+    Dim members As JSONItem = WorkspaceMembers(root, settings)
+    Dim writers As Array Of String = ClaimWorkspaceWriters(root, members)
+    Try
+    Dim field As String = "dependencies"
+    If action = "replace" Or action = "unreplace" Then
+        field = "replace"
+    End If
+    Dim values As JSONItem = settings.Value(field)
+    If Not values.IsObject() Then
+        values = JSONItem.NewObject()
+    End If
+    If action = "remove" Or action = "unreplace" Then
+        If args.Count <> 3 Or Not values.HasKey(name) Then
+            Throw New Exception("No such dependency or replacement: " + name)
+        End If
+        values.Remove(name)
+    ElseIf action = "update" Then
+        If args.Count <> 4 Or Not values.HasKey(name) Then
+            Throw New Exception("Usage: bpm update <existing-name> <minimum-version>")
+        End If
+        ParseVersion(args(3))
+        Dim source As JSONItem = values.Value(name)
+        If Not source.HasKey("git") And Not source.HasKey("registry") Then
+            Throw New Exception("Version updates require a git or registry dependency")
+        End If
+        source.Remove("rev")
+        source.Value("version") = args(3)
+    Else
+        Dim source As JSONItem = JSONItem.NewObject()
+        Dim index As Integer = 3
+        While index < args.Count
+            If index + 1 >= args.Count Or Not String.StartsWith(args(index), "--", True) Then
+                Throw New Exception("Source options require --key value pairs")
+            End If
+            Dim key As String = String.Substring(args(index), 2)
+            If source.HasKey(key) Then
+                Throw New Exception("Repeated source option: " + key)
+            End If
+            source.Value(key) = args(index + 1)
+            index += 2
+        End While
+        ValidateSource(source)
+        values.Value(name) = source
+    End If
+    settings.Value(field) = values
+    Dim work As String = MetadataSnapshot(root, "edit", MetadataTargets(root))
+    Try
+        ' Retain the conventional manifest backup name for manual inspection.
+        WriteText(Path.Join(work, "original"), original)
+        SaveObject(Path.Join(work, "bpm.json"), settings)
+        AtomicCopy(Path.Join(work, "bpm.json"), filename)
+        Resolve(root)
+        ' Selection commits before installation starts. An interrupted install
+        ' can then recover independently without reverting its matching lock.
+        WriteText(Path.Join(work, "committed"), "yes")
+        If settings.HasKey("workspaces") Then
+            Print "Workspace manifests and locks updated; run bpm sync to install"
+        Else
+            SyncAll(root, True)
+        End If
+        DiscardGuard(work)
+    Catch e As Exception
+        Try
+            RestoreMetadata(root, "metadata")
+            RestoreMetadata(root, "edit")
+        Catch recovery As Exception
+            StdErr.WriteLine("Metadata rollback incomplete; backups retained at " + work)
+            Throw New Exception(e.Message + "; metadata rollback incomplete: " + recovery.Message)
+        End Try
+        Throw e
+    End Try
+    Finally
+        ReleaseWriters(writers)
+    End Try
+End Sub
+
+Sub ExplainPath(name As String, target As String, graph As JSONItem, chain As String)
+    Dim nextPath As String = chain + " -> " + name
+    If name = target Then
+        Print nextPath
+        Return
+    End If
+    For Each child As String In graph.Value(name).Value("dependencies").Keys()
+        ExplainPath(String.LCase(child), target, graph, nextPath)
+    Next
+End Sub
+
+Sub Explain(root As String, name As String)
+    Dim lock As JSONItem = Locked(root)
+    Dim graph As JSONItem = lock.Value("packages")
+    If Not graph.HasKey(String.LCase(name)) Then
+        Throw New Exception("Package is not locked: " + name)
+    End If
+    For Each dependency As String In Manifest(root).Value("dependencies").Keys()
+        ExplainPath(String.LCase(dependency), String.LCase(name), graph, "root")
+    Next
+End Sub
+
+Sub Usage()
+    Print "bpm 0.3.0 — Buoy package manager"
+    Print "Usage: bpm init | resolve | fetch | install | ci | sync | vendor | verify | doctor"
+    Print "       bpm add|replace <name> --git <url> --version <minimum> [--subdir <path>]"
+    Print "       bpm add|replace <name> --rev <ref> --git <url> | --path <path> | --archive <file>"
+    Print "       bpm remove|unreplace <name> | update <name> <minimum> | list | why <name>"
+    Print "       bpm publish | repair"
+    Print "       bpm pack [--dry-run] | check <entry.bui> | build <entry.bui> [compiler flags...]"
+    Print "Run in the directory containing bpm.json. No dependency scripts run."
+End Sub
+
+Function RunMain(args As Array Of String) As Integer
+    If args.Count < 2 Then
+        Usage()
+        Return 2
+    End If
+    If args(1) = "--version" Then
+        Print "bpm 0.3.0"
+        Return 0
+    End If
+    If args(1) = "--help" Then
+        Usage()
+        Return 0
+    End If
+    Dim guard As String = ""
+    Try
+        Dim root As String = RootPath(".")
+        Dim action As String = args(1)
+        If action = "repair" And args.Count = 2 Then
+            Repair(root)
+            Return 0
+        End If
+        If action = "doctor" Then
+            Print Command([System.EnvironmentVariable("BPM_BUOY").Or("buoy"), "--version"])
+            Print Command(["git", "--version"])
+            Dim work As String = Temporary()
+            Try
+                Dim packageRoot As String = Path.Join(work, "package")
+                MakeDirectory(Path.Join(packageRoot, "resources"))
+                WriteText(Path.Join(packageRoot, "resources/doctor.txt"), "bpm package CLI probe\n")
+                WriteText(Path.Join(packageRoot, "manifest.json"), "{\"schema\":1,\"name\":\"bpm_doctor\",\"version\":\"0.0.0\",\"platforms\":[]}")
+                Command([Packager(), "pkg", "seal", packageRoot, "-o", Path.Join(work, "doctor.buipkg")])
+                Print "Package CLI: " + ArchivePackageName(Path.Join(work, "doctor.buipkg"))
+                Print "SHA-256: " + SHA256(Path.Join(work, "doctor.buipkg"))
+            Finally
+                RemoveTemporary(work)
+            End Try
+            Print "Compiler scans ambient global packages; strict isolated builds require upstream support."
+            Print "BPM_PACKAGER selects the package CLI; BPM_BUOY selects the compiler."
+            Return 0
+        End If
+        If action = "init" Or action = "resolve" Or action = "sync" Or action = "vendor" Or action = "pack" Or action = "fetch" Or action = "install" Or action = "ci" Or action = "add" Or action = "replace" Or action = "remove" Or action = "unreplace" Or action = "update" Or action = "publish" Then
+            If action <> "pack" Or args.Count <> 3 Or args(2) <> "--dry-run" Then
+                MakeDirectory(Path.Join(root, ".bpm"))
+                NoSymlink(Path.Join(root, ".bpm"))
+                Dim candidateGuard As String = Path.Join(root, ".bpm/write-lock")
+                ExclusiveDirectory(candidateGuard)
+                guard = candidateGuard
+                WriteText(Path.Join(guard, "owner"), Str(BPMProcessID()))
+            End If
+        End If
+        If action = "init" And args.Count = 2 Then
+            Dim file As New FileSystemItem(Path.Join(root, "bpm.json"))
+            NoSymlink(file.FullPath())
+            If file.Exists() Then
+                Throw New Exception("bpm.json already exists")
+            End If
+            Dim settings As New JSONItem
+            settings.Value("schema") = 1.0
+            settings.Value("dependencies") = JSONItem.NewObject()
+            SaveObject(file.FullPath(), settings)
+            Print "Created bpm.json"
+        ElseIf action = "resolve" And args.Count = 2 Then
+            Resolve(root)
+        ElseIf action = "publish" And args.Count = 2 Then
+            Publish(root)
+        ElseIf (action = "add" Or action = "replace" Or action = "remove" Or action = "unreplace" Or action = "update") Then
+            EditDependency(root, action, args)
+        ElseIf action = "list" And args.Count = 2 Then
+            Print Canonical(Locked(root).Value("packages"))
+        ElseIf action = "why" And args.Count = 3 Then
+            Explain(root, args(2))
+        ElseIf action = "fetch" And args.Count = 2 Then
+            Recover(root, False)
+        ElseIf (action = "sync" Or action = "vendor" Or action = "install" Or action = "ci") And args.Count = 2 Then
+            If action = "install" Then
+                Dim existingLock As New FileSystemItem(Path.Join(root, "bpm.lock"))
+                If Not existingLock.IsFile() Then
+                    Resolve(root)
+                End If
+            End If
+            SyncAll(root, action <> "install")
+            If action = "vendor" Then
+                Print "Commit bpm.json, bpm.lock and the locked archives in packages/. .bpm/ is disposable."
+            End If
+        ElseIf action = "verify" And args.Count = 2 Then
+            VerifyAll(root)
+        ElseIf action = "pack" And (args.Count = 2 Or (args.Count = 3 And args(2) = "--dry-run")) Then
+            Dim settings As JSONItem = Manifest(root)
+            Dim metadata As JSONItem = PackageMetadata(root)
+            If settings.Value("replace").Count() > 0 Then
+                Throw New Exception("Packing a release with replacements is not supported; remove development overrides")
+            End If
+            For Each name As String In settings.Value("dependencies").Keys()
+                ValidatePublicationSource(settings.Value("dependencies").Value(name), name)
+            Next
+            If args.Count = 3 Then
+                Dim report As New JSONItem
+                Dim files As JSONItem = JSONItem.NewArray()
+                Dim plannedFiles As Array Of String = PackageFiles(root, settings)
+                ValidatePackagePlan(metadata, plannedFiles)
+                For Each relative As String In plannedFiles
+                    Dim item As New JSONItem
+                    Dim file As New FileSystemItem(Path.Join(root, relative))
+                    item.Value("path") = relative
+                    Dim byteCount As Double = file.Length()
+                    item.Value("bytes") = byteCount
+                    item.Value("sha256") = SHA256(file.FullPath())
+                    files.Add(item)
+                Next
+                report.Value("files") = files
+                Dim releaseFiles As JSONItem = JSONItem.NewArray()
+                For Each relative As String In ReleasePaths(root, settings, metadata)
+                    releaseFiles.Add(relative)
+                Next
+                report.Value("releaseFiles") = releaseFiles
+                Print Json.Stringify(report)
+            Else
+                PackRelease(root, settings, metadata)
+            End If
+        ElseIf (action = "build" Or action = "check") And args.Count >= 3 Then
+            VerifyAll(root)
+            Dim commandArgs As Array Of String = []
+            Array.Append(commandArgs, System.EnvironmentVariable("BPM_BUOY").Or("buoy"))
+            For i As Integer = 2 To args.Count - 1
+                Array.Append(commandArgs, args(i))
+            Next
+            If action = "check" Then
+                Array.Append(commandArgs, "--check")
+                Array.Append(commandArgs, "--diagnostic-format")
+                Array.Append(commandArgs, "json")
+            End If
+            Print Command(commandArgs)
+        Else
+            Usage()
+            Return 2
+        End If
+        Return 0
+    Catch e As Exception
+        StdErr.WriteLine("bpm: " + e.Message)
+        Return 1
+    Finally
+        If guard <> "" Then
+            Dim metadataRecovery As New FileSystemItem(Path.Join(guard, "metadata"))
+            Dim editRecovery As New FileSystemItem(Path.Join(guard, "edit"))
+            If metadataRecovery.Exists() Or editRecovery.Exists() Then
+                StdErr.WriteLine("Metadata recovery remains at " + guard + "; run bpm repair")
+            Else
+                Try
+                    DiscardGuard(guard)
+                Catch cleanup As Exception
+                    Throw New Exception("final writer cleanup failed: " + cleanup.Message)
+                End Try
+            End If
+        End If
+    End Try
+End Function
+
+Function Main(args As Array Of String) As Integer
+    Try
+        Return RunMain(args)
+    Catch cleanup As Exception
+        StdErr.WriteLine("bpm: " + cleanup.Message)
+        Return 1
+    End Try
+End Function

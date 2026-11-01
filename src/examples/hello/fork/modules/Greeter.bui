@@ -1,0 +1,3 @@
+Public Function Message() As String
+    Return "Hello from the local fork"
+End Function

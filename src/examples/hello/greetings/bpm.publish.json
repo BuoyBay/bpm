@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "dependencies": {},
+  "files": ["modules", "resources", "README.md"],
+  "publish": {
+    "registry": "../registry",
+    "package": "@demo/greetings"
+  }
+}
