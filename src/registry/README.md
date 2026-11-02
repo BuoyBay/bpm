@@ -176,5 +176,3 @@ pack/publish/install/verify with immutable publication retry. Token-containing
 client/server diagnostics are rejected. Test certificates are temporary and
 explicitly trusted; public-network infrastructure and real certificate renewal
 are separate deployment validation.
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.

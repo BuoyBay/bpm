@@ -136,8 +136,6 @@ than treating a matching version string as sufficient.
 
 ## Evidence and priority
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
 The explicit package map and live mapped sources have the highest immediate
 upstream value. The native process backend is implemented locally; a built-in
 process API is an optional upstream enhancement. Package-qualified types require broader language

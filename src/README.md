@@ -5,11 +5,6 @@ minimum-version resolution, exact commit pins, fork overrides, locked recovery,
 vendoring, workspaces, immutable publication and package inspection. It feeds the
 compiler's existing `.buipkg` system and preserves source imports.
 
-Start with the [runnable walkthrough](examples/hello/README.md). The
-[system design](DESIGN.md) records the architecture and consultation decisions;
-[Buoy requests](BUOY_REQUESTS.md) describes proposed compiler improvements.
-Audit follow-up (private maintainer material) records independent findings and their resolution.
-
 ## Build and verify
 
 Requires Buoy 0.72.0 or compatible, Git and tar; HTTPS registries also require
@@ -357,9 +352,6 @@ trusted test CA. These tests do not establish public-network interoperability or
 arbitrary host/toolchain combinations. Linux and ARM64 macOS execute the suite;
 Windows x64 executes the bounded archive-installation and consumer workflows in
 the [platform acceptance matrix](PLATFORMS.md).
-Real-process contention, a 61-package graph, and curl/TLS acquisition are also
-covered by maintainer validation. Dedicated suites and detailed reports remain
-private local inputs and are omitted from public checkouts.
 
 The [reference registry service](registry/README.md) is a separate executable;
 operating a public service, signed provenance, source-only vendor export and

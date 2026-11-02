@@ -1,7 +1,7 @@
-# Install and lock Buoy packages from Git
+# Install and lock packages from Git, with exact-source recovery, vendoring and offline CI
 
 BPM acquires source packages, resolves declared dependencies and installs sealed
-`.buipkg` archives without changing your Buoy imports. Lockfiles pin exact commits
+`.buipkg` archives without changing your imports. Lockfiles pin exact commits
 and artifact hashes; recovery, vendoring and offline CI use those recorded inputs.
 
 ## Install a package
@@ -47,7 +47,5 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 [Contributing](CONTRIBUTING.md) · [License](LICENSE)

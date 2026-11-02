@@ -93,17 +93,13 @@ provenance records, not verified signatures or trusted build attestations.
 Signing, trusted CI publication and transparency logs need a separate trust
 protocol. Never equate a same-named package from another registry automatically.
 
-## Tests and compatibility
+## Deployment checks
 
-`test_https_registry_protocol_and_secret_redaction` exercises GET/conditional PUT
-semantics with a transport fixture. Other tests exercise real filesystem
-publication, immutable versions, dirty/tampered bundle rejection, frozen recovery
-and payload digest failures. `tests/test_bpm_registry_server.py` additionally
-builds and runs the actual reference service over real TLS, including bpm
-publication/installation, concurrent conditional creation, metadata consistency,
-authentication, scope enforcement, symlinks and request limits. Authenticated
-payload reads before the final commit record support interrupted-upload recovery;
-consumers must still discover releases through `release.json`. Public-network
-service deployment, real certificate chains and broader load/fault behavior need
-environment-specific validation; local integration tests do not establish those
-properties.
+Exercise GET and conditional PUT against your configured endpoint. Confirm scope
+and bearer-token enforcement, immutable version records, payload digests and
+interrupted-upload recovery. Consumers discover a complete release through
+`release.json`; payload availability alone is not a committed release.
+
+Validate certificate trust, storage isolation, request limits and the intended
+load/fault behavior in the deployment environment. Local protocol checks do not
+establish production network or certificate configuration.

@@ -76,7 +76,6 @@ library bytes; sealing checks those bytes. Client builds seal a private package.
 Individual file replacement is atomic; publication of a whole executable bundle
 is not. An interrupted copy invalidates its inventory and requires rebuilding.
 
-Native ABI verification is maintained privately with the workspace validation inputs.
 Native ABI execution is recorded on Linux x64, ARM64 macOS and Windows 11 x64;
 see [platform scopes](../PLATFORMS.md) for expected skips and toolchain limits.
 A remote native ABI

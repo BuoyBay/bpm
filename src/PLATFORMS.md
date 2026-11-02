@@ -1,71 +1,44 @@
-# Native platform acceptance
+# BPM platform requirements
 
-These results describe actual execution of bpm 0.3.0 with Buoy 0.72.0, not just
-cross-target compiler checks. They do not certify arbitrary hosts or deployments.
+BPM is a native command-line client. Compiler checking, native linking and actual
+execution establish different properties; validate the selected toolchain on the
+host that will run the client.
 
-| Host | Confirmed native behavior | Remaining boundary |
+| Platform | Build path | Requirements and boundaries |
 | --- | --- | --- |
-| Linux x86_64 | Core resolver/install/publication, native helper, process contention, larger graph, TLS download faults, documentation lifecycle, real TLS registry and consumer execution | Public deployment, certificate chains, broad load and power-loss behavior |
-| macOS ARM64 | Native build, core 49 tests, portable client/stress/documentation tests, native helper, copied-bundle health checks, Git argument boundaries and tar member parity | Intel Mac execution and other macOS/toolchain versions |
-| Windows 11 x64 | Client initialization, locked archive installation, verification/offline CI, native consumer checking/building/execution, SHA-256, guard recovery, reparse/global-store rejection and real HTTPS Git transport | Native Buoy package sealing fails; original `pkg info` mishandles Unicode archive paths |
+| Linux x86_64/ARM64 | Native `tools/build_bpm.bui` driver | C11 compiler, matching Buoy SDK, ProcessKit source, Git/tar/coreutils; curl for HTTPS registries |
+| macOS | `tools/build_bpm.py` compatibility builder | Matching Buoy SDK and Apple command-line tools; copy deployed dylibs with the executable |
+| Windows x64 | Compatibility/cross-target builder | Matching C/C++ runtime and native bridge; Buoy 0.72.0 package-command limitations apply |
 
-The final Linux run after audit fixes ran 113 tests with three Windows-only skips.
-The Mac run completed 85 tests with five platform skips, including the audit and
-environment regressions; Linux-only path-policy, audit25, build-input mutation,
-strace cleanup, shared-install and registry suites
-are outside that run. Exact source/binary hashes, native commands, diagnostics,
-outputs and final focused reruns are recorded in:
+See the [build guide](README.md) for commands and explicit toolchain overrides.
 
-- Linux and cross-platform audit history (private maintainer material)
-- Mac native capture
-- Mac focused captures
-- Final Mac build and tests
-- Final Mac collected inventory
-- Final acceptance record and Linux log
-- Windows native capture
+## macOS deployment
 
-## macOS distribution
+The compatibility builder copies non-system Mach-O dependencies, removes
+build-machine search paths, adds executable/loader-relative paths and refreshes
+ad-hoc signatures. Copy the runtime inventory's files together. The packer
+disables copyfile metadata so tar members do not acquire AppleDouble additions.
+Exercise the copied deployment with the SDK/runtime configuration intended for
+its destination machine.
 
-The isolated builder copies non-system Mach-O dependencies, removes build-machine
-runtime search paths, adds executable/loader-relative paths and refreshes ad-hoc
-signatures. The runtime inventory lists the files to copy together. Native tests
-run the copied bundle with a clean DYLD environment after the private build has
-gone away. The packer disables macOS copyfile metadata so tar members match the
-reviewed file list without AppleDouble additions.
+## Windows package commands
 
-## Windows boundaries and workarounds
+The client preserves the compiler-generated UAC/DPI settings while enabling
+UTF-8 filesystem handling. Cleanup treats junctions as leaves and removes Git's
+read-only attributes without traversing reparse targets.
 
-The client activation manifest enables UTF-8 for its CRT filesystem operations
-while preserving the compiler-generated UAC and DPI settings. Windows cleanup
-uses no-follow handles, clears Git's read-only file attributes and removes
-junctions as leaves; native ABI tests cover the victim directory remaining intact.
+Buoy 0.72.0's native Windows `pkg seal` can fail even on ASCII source paths.
+Use compatible, already sealed ZIP Store `.buipkg` archives for installation, or
+select a working Linux/macOS packager for source sealing. Source replacement,
+`pack`, publication and `doctor` require a working package CLI.
 
-Use already sealed, ZIP Store `.buipkg` artifacts for the validated installation
-workflow. The native Windows compiler's source-only `pkg seal` fails even with
-ASCII paths, leaving an empty ZIP. Source dependency resealing, local source
-replacement, `pack`, publication and `doctor` therefore remain blocked with that package CLI;
-use a working Linux/Mac sealer rather than rewriting locked artifact bytes.
-See BUI-320.
+That SDK's original `pkg info` also has a Unicode archive-path limitation.
+Select a compatible toolchain explicitly with BPM's compiler/packager overrides;
+BPM does not patch the installed compiler automatically.
 
-The original Windows `pkg info` additionally misreads Unicode archive paths;
-see BUI-321.
-The capture includes an explicit test-only UTF-8 activation change to a private,
-unsigned compiler copy, leaving the installed compiler hash unchanged. With that
-copy selected explicitly, Unicode archive installation and native consumer
-execution pass. This is a local diagnostic/workaround, not automatic compiler
-patching or a distributed modified toolchain; ASCII sealing still fails.
+Windows Git payloads are checked after fetch. This backend does not implement
+POSIX `RLIMIT_FSIZE` during Git acquisition; apply appropriate storage quotas
+for the deployment.
 
-The Windows lab already applies the documented Buoy stack-reserve/runtime-path
-workarounds. The native capture records that toolchain's exact hash. Windows Git
-payloads are checked after fetch, but a POSIX `RLIMIT_FSIZE` fetch-time limit has
-no Windows equivalent in this backend; filesystem quotas remain deployment policy.
-
-## Repeating validation
-
-Use macos_validate.py (maintainer-local) and
-windows_validate.py (maintainer-local) with the existing authorized lab hosts.
-They stage private projects and preserve evidence; do not replace shared toolchains
-or another team's workspace. The registry reference executable remains a separate
-Linux service with its own [deployment limits](registry/README.md).
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.
+The [reference registry](registry/README.md) is a separate Linux service with its
+own TLS, filesystem and deployment requirements.
