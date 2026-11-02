@@ -40,12 +40,4 @@ the Linux client. It rejects cross-target requests. Retain every runtime file in
 the generated deployment receipt when moving the executable. Platform-specific
 support and limits are documented in [PLATFORMS.md](src/PLATFORMS.md).
 
-## Local Buoy setup
-
-On your own machine, install Buoy and run:
-
-```sh
-buoy ai init --both
-```
-
 [Contributing](CONTRIBUTING.md) · [License](LICENSE)
