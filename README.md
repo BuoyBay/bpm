@@ -1,4 +1,4 @@
-# Git package installer — lockfiles, vendoring, offline CI
+# Install and lock Git packages
 
 BPM acquires source packages, resolves declared dependencies and installs sealed
 `.buipkg` archives without changing your imports. Lockfiles pin exact commits
